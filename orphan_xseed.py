@@ -7,13 +7,15 @@ files you already have (stopped, hash check skipped, renamed onto your files).
 
   1  scan      folders vs qBittorrent (hardlink / inode aware), grouped into
                releases: a movie folder with its screens/nfo, an album with its
-               CDs, a series pack with its season folders - never file by file
+               CDs, a series pack with its season folders (also nested ones),
+               a collection with each of its movies - never file by file
                -> orphans.txt, orphan_extras.txt, orphan_files.txt, orphans.json
-  2  search    Prowlarr with several name variants per release / season folder /
-               sub-release; a result must match the size (exact, the indexer's
-               rounding, or within 0.1%) and must not CONFLICT on group, codec,
-               source, resolution, service, edition, year or season/episode
-               -> candidates.txt, candidates.json
+  2  search    Prowlarr with several name variants per release AND per season
+               folder / sub-release / movie of a collection; a result needs the
+               same title, the size (exact, the indexer's rounding, or within
+               0.1%) and no CONFLICT on group, codec, source, resolution,
+               service, edition, year or season/episode
+               -> candidates.txt, candidates.json, near_misses.txt
   3  download  .torrent files (approve each / all), verify file tree against
                your files and spot-check real piece hashes
                -> torrents/*.torrent, downloads.txt, downloads.json
@@ -23,9 +25,10 @@ files you already have (stopped, hash check skipped, renamed onto your files).
                yours, or one with extras you don't have, sits in a hardlink
                folder on the same disk (<disk>/hardlinked/xseed)
                -> added.txt, added.json
-  5  near      near misses from step 2 (right size, rejected by a rule): try them
-               one by one / all / by number - download, check pieces, add
-               the ones that really are your data  -> near_misses.txt
+  5  near      near misses from step 2 - same title, but a label differs
+               (mislabeled upload) or the size is off by extras: try them one
+               by one / all / by number - download, check pieces, add the ones
+               that really are your data
 
 Python 3.8+, standard library only. Every HTTP call and decision is written to
 <work_dir>/logs/*.log; run with --debug to also see it live.
@@ -61,7 +64,7 @@ import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG_NAME = "orphan_xseed.json"
 
@@ -161,7 +164,16 @@ DEFAULT_CONFIG = {
                                       "accepted on title + no conflicting tags, for *arr-renamed files that have no "
                                       "tags left to compare. Step 3's piece check has the final word.",
         "min_title_similarity": 0.6,
-        "near_min_title_similarity": 0.75,
+        "_min_title_similarity_help": "Titles must be the SAME (punctuation, articles, 'II' vs '2' ignored) or differ "
+                                      "only by spelling / a subtitle with the same year. Only a byte-exact size may "
+                                      "get away with a title that is merely this similar (0-1).",
+        "near_miss_max_bigger_pct": 20,
+        "near_miss_max_smaller_pct": 5,
+        "near_misses_per_target": 3,
+        "_near_miss_help": "Near misses (option 5) always need the same title, a compatible year and the same "
+                           "season/episode. Then either the size fits but a label differs (720p vs 1080p, group...), "
+                           "or nothing conflicts and the torrent is up to 20% bigger (featurettes, extras, episodes "
+                           "you don't have) or 5% smaller than yours. At most this many per movie/season, best first.",
         "min_score": 55,
         "stop_when_score_at_least": 85,
         "max_candidates_per_item": 8,
@@ -1430,6 +1442,71 @@ def title_similarity(local_titles, result_title):
     return round(best, 3)
 
 
+_ROMAN = {"ii": "2", "iii": "3", "iv": "4", "vi": "6", "vii": "7", "viii": "8", "ix": "9"}
+_NUMWORDS = {"one": "1", "two": "2", "three": "3", "four": "4", "five": "5", "six": "6", "seven": "7", "eight": "8",
+             "nine": "9", "ten": "10"}
+_TITLE_STOP = {"the", "a", "an", "and"}
+PACK_WORDS = {"collection", "complete", "trilogy", "duology", "quadrilogy", "pentalogy", "hexalogy", "saga",
+              "anthology", "boxset", "box", "set", "pack", "franchise", "films", "movies", "all", "parts", "series"}
+
+
+def title_key(title, pack=False):
+    """'The Lord of the Rings: The Two Towers' -> ['lord','of','rings','2','towers'] - what two names must share to
+    be the same title. Articles, 'and', punctuation, accents, II/III and 'Part Two' don't matter."""
+    toks = title_tokens(title)
+    out = []
+    for i, t in enumerate(toks):
+        if t in _TITLE_STOP or re.match(r"^(?:cd|disc|disk)\d{1,2}$", t):
+            continue
+        if pack and (t in PACK_WORDS or t in ("film", "movie") or YEAR_RE.match(t) or
+                     (t.isdigit() and i + 1 < len(toks) and toks[i + 1] in ("film", "films", "movie", "movies"))):
+            continue  # 'Harry Potter Complete 8-Film Collection 2001-2011' -> 'harry potter'
+        if t in _ROMAN:
+            t = _ROMAN[t]
+        elif t in _NUMWORDS and i > 0 and toks[i - 1] in ("part", "chapter", "vol", "volume", "episode", "book"):
+            t = _NUMWORDS[t]
+        elif t == "volume":
+            t = "vol"
+        out.append(t)
+    return out
+
+
+def title_match(ltitles, lyear, rp, pack=False):
+    """Is the result the same TITLE as ours? -> 'same' | 'close' | None.
+    same : identical once punctuation/articles/numbering style are ignored ('Spider-Man: No Way Home' =
+           'Spider Man No Way Home', 'American Pie II' = 'American Pie 2')
+    close: a spelling difference (>= 90% alike, same numbers), or one title is the other plus a subtitle
+           AND both carry the same year ('Star Wars The Empire Strikes Back 1980' vs 'The Empire Strikes Back 1980')
+    'Behind the Attraction' vs 'Attraction', 'American Pie 2' vs 'American Pie' -> None"""
+    rtitle = rp.title or rp.normalized
+    rts = [rtitle] + alt_titles(rtitle)
+    same_year = bool(lyear and rp.year and str(lyear) == str(rp.year))
+    best = None
+    for lt in ltitles:
+        a = title_key(lt, pack)
+        if not a:
+            continue
+        ja = "".join(a)
+        for rt in rts:
+            b = title_key(rt, pack)
+            if not b:
+                continue
+            jb = "".join(b)
+            if ja == jb:
+                return "same"
+            if best:
+                continue
+            nums_a, nums_b = [x for x in a if x.isdigit()], [x for x in b if x.isdigit()]
+            if nums_a == nums_b and min(len(ja), len(jb)) >= 5 and \
+                    difflib.SequenceMatcher(None, ja, jb).ratio() >= 0.9:
+                best = "close"
+            elif same_year:
+                short, long_ = (a, b) if len(a) < len(b) else (b, a)
+                if len(short) >= 2 and (long_[:len(short)] == short or long_[-len(short):] == short):
+                    best = "close"
+    return best
+
+
 # --------------------------------------------------------------------------- step 1: scan
 
 
@@ -1729,7 +1806,7 @@ def step_scan(cfg, paths, qb=None):
              "orphan_files": len(orphans), "orphan_bytes": sum(f.size for f in orphans),
              "orphan_releases": len(releases), "orphan_release_bytes": sum(r["orphan_size"] for r in releases),
              "leftover_releases": len(leftovers)}
-    write_json(paths.orphans_json, {"version": 2, "generated": now_iso(), "roots": roots, "stats": stats,
+    write_json(paths.orphans_json, {"version": 3, "generated": now_iso(), "roots": roots, "stats": stats,
                                     "releases": releases,
                                     "leftovers": [{"path": p, "orphans": [f.path for f in o]} for p, fl, o in leftovers]})
     write_text(paths.orphan_files_txt, ["# every single file no torrent points at (debug list). The list to read is "
@@ -1739,8 +1816,9 @@ def step_scan(cfg, paths, qb=None):
         per_root.setdefault(r["root"], []).append(r)
     lines = ["# orphan releases - things on disk that no torrent in qBittorrent covers (FULL) or only partly covers "
              "(PART).",
-             "# One line per release (movie folder incl. screens/nfo, album incl. CDs, series pack...). Season folders "
-             "and", "# sub-releases found inside are indented; step 2 searches all of them.",
+             "# One line per release (movie folder incl. screens/nfo, album incl. CDs, series pack, collection...).",
+             "# Indented below it: season folders (also inside packs), sub-releases and each movie of a collection -",
+             "# step 2 searches the release as a whole AND each of those.",
              "# generated %s   every single file: orphan_files.txt   releases with only extras (nfo/srt/jpg) "
              "unseeded: orphan_extras.txt" % now_iso(), ""]
     for root in roots:
@@ -1753,8 +1831,8 @@ def step_scan(cfg, paths, qb=None):
             lines.append("%s %10s  %-12s %s%s   [%s]" % ("FULL" if full else "PART", fmt_size(r["orphan_size"]),
                                                        unit_label(r), r["path"], "/" if r["is_dir"] else "", what))
             for u in r["units"]:
-                lines.append("%s %10s  %-12s %s/" % (" " * 4, fmt_size(u["total_size"]), unit_label(u),
-                                                     os.path.relpath(u["path"], r["path"])))
+                lines.append("%s %10s  %-12s %s%s" % (" " * 4, fmt_size(u["total_size"]), unit_label(u),
+                                                      os.path.relpath(u["path"], r["path"]), "/" if u["is_dir"] else ""))
         lines.append("")
     write_text(paths.orphans_txt, lines)
     ex = ["# releases where only small extra files (nfo, srt, jpg, samples...) are not covered by a torrent - usually "
@@ -1787,6 +1865,10 @@ MB = 1024 * 1024
 
 
 def unit_label(u):
+    if u.get("collection"):
+        return "collection"
+    if u.get("kind") == "work":
+        return "movie" if u.get("media") == "video" else "item"
     se = u.get("se") or [None]
     lab = se_label(*se) if se[0] else None
     if u.get("media") == "audio":
@@ -1822,10 +1904,20 @@ def build_releases(local, roots, containers, cfg):
         elif SEASON_DIR_RE.match(name) or GENERIC_DIR_RE.match(name) or looks_release(name):
             r = (False, "")
         else:
-            subs = child_dirs.get(d, ())
-            rel_subs = sum(1 for c in subs if looks_release(os.path.basename(c)))
+            # holds releases of DIFFERENT things -> container. Seasons of one show ('Show/Season 1', 'Show/Show.S02...')
+            # and a franchise ('Harry Potter/Harry.Potter.and.the...') are one release with parts, searched both ways.
+            keys = set()
+            for c in child_dirs.get(d, ()):
+                cn = os.path.basename(c)
+                if looks_release(cn):
+                    k = work_key(cn)
+                    if k:
+                        keys.add(k[:2])
             direct_content = any(file_kind(f.path) in ("video", "audio") for f in direct.get(d, []))
-            r = (rel_subs >= 2 and not direct_content, "holds %d release folders, no media of its own" % rel_subs)
+            own = "".join(title_key(Parsed(name).title or name, pack=True))
+            franchise = bool(own) and bool(keys) and all(k[1].startswith(own) for k in keys)
+            r = (len(keys) >= 2 and not direct_content and not franchise,
+                 "holds %d different releases, no media of its own" % len(keys))
         verdict[d] = r
         return r[0]
 
@@ -1855,7 +1947,77 @@ def build_releases(local, roots, containers, cfg):
     return releases, leftovers, verdict
 
 
-def _make_unit(upath, kind, files, root, release_path):
+def work_key(name):
+    """Identity of a movie-like item. Same title + year + resolution + edition = the same work; seasons / episodes of
+    one show share one key. None for 'Season 1', 'Extras', 'CD1'..."""
+    if SEASON_DIR_RE.match(name) or GENERIC_DIR_RE.match(name):
+        return None
+    p = Parsed(name)
+    k = "".join(title_key(p.title or p.normalized))
+    if not k:
+        return None
+    if p.se_kind:
+        return ("show", k)
+    return ("movie", k, p.year, p.res_n, tuple(sorted(p.cuts)))
+
+
+TRACK_RE = re.compile(r"^\d{1,3}(?:\s*[-._)\]]\s*|\s+)")
+MAX_WORKS = 30
+
+
+def works_in(direct_files, subdirs, min_content):
+    """Two or more DIFFERENT movies directly in one folder - as loose files ('American Pie/American.Pie.1999...mkv',
+    'American.Pie.2.2001...mkv') or one folder each ('Harry Potter/Harry Potter and the Chamber of Secrets/') ->
+    [(path, is_dir, files)], else []. Not movies: featurettes (< 1/4 of the biggest), episodes (S01E01, or 'Show - 01'
+    / 'Show - 02' numbered without years), concert tracks ('01 - Song.mkv'), folders with > MAX_WORKS videos."""
+    cands = []
+    for f in direct_files:
+        if file_kind(f.path) != "video":
+            continue
+        name = os.path.basename(f.path)
+        p = Parsed(name)
+        if p.se_kind or (TRACK_RE.match(name) and not (p.year or p.res_n)):
+            continue
+        k = work_key(name)
+        if k:
+            cands.append((k, f.path, False, [f], f.size))
+    for dpath, sf in subdirs:
+        name = os.path.basename(dpath)
+        if SEASON_DIR_RE.match(name) or GENERIC_DIR_RE.match(name) or Parsed(name).se_kind:
+            continue
+        vids = [f for f in sf if file_kind(f.path) == "video"]
+        vbytes = sum(f.size for f in vids)
+        content = sum(f.size for f in sf if file_kind(f.path) in CONTENT_KINDS)
+        if not vids or vbytes < 0.5 * content or any(Parsed(os.path.basename(f.path)).se_kind for f in vids):
+            continue  # music, or a show
+        mk = work_key(os.path.basename(max(vids, key=lambda f: f.size).path))
+        k = work_key(name) or mk
+        if k and mk and mk[0] == "movie" and k[0] == "movie":  # 'Harry Potter and the...' (no year) + the file's year
+            k = (k[0], k[1], k[2] or mk[2], k[3] or mk[3], k[4] or mk[4])
+        if k:
+            cands.append((k, dpath, True, sf, vbytes))
+    if len(cands) < 2:
+        return []
+    big = max(c[4] for c in cands)
+    cands = [c for c in cands if c[4] >= max(min_content, 0.25 * big)]
+    # 'Show - 01', 'Show - 02' (no years) are episodes; 'American Pie 1999', 'American Pie 2 2001' are movies
+    by_base = {}
+    for c in cands:
+        by_base.setdefault(re.sub(r"\d+$", "", c[0][1]), []).append(c)
+    drop = set()
+    for grp in by_base.values():
+        if len(set(c[0] for c in grp)) >= 2:
+            years = [c[0][2] for c in grp if c[0][0] == "movie"]
+            if len(years) < len(grp) or None in years or len(set(years)) < len(set(c[0][1] for c in grp)):
+                drop.update(id(c) for c in grp if re.search(r"\d$", c[0][1]) or len(grp) > 2)
+    cands = [c for c in cands if id(c) not in drop]
+    keys = set(c[0] for c in cands)
+    if len(keys) < 2 or len(cands) > MAX_WORKS:
+        return []
+    return [(c[1], c[2], c[3]) for c in cands]
+
+
+def _make_unit(upath, kind, files, root, release_path, ancestors=()):
     kinds = [(f, file_kind(f.path)) for f in files]
     content = [f for f, k in kinds if k in CONTENT_KINDS]
     video = sum(f.size for f, k in kinds if k == "video")
@@ -1873,6 +2035,8 @@ def _make_unit(upath, kind, files, root, release_path):
     if kind == "season":
         m = SEASON_DIR_RE.match(name)
         se = ["season", int(m.group(1) or m.group(2)) if m else p.season_n, None, None]
+    elif kind == "work":
+        se = [None, None, None, None]
     elif p.se_kind:
         se = [p.se_kind, p.season_n, p.episode_n, list(p.seasons) if p.seasons else None]
     else:
@@ -1881,7 +2045,7 @@ def _make_unit(upath, kind, files, root, release_path):
               ["multi", None, None, seasons] if seasons else [None, None, None, None])
     return {
         "id": short_id(upath), "kind": kind, "path": upath, "name": name, "root": root, "release_path": release_path,
-        "is_dir": os.path.isdir(upath),
+        "is_dir": os.path.isdir(upath), "ancestors": list(ancestors),
         "total_size": sum(f.size for f in files), "content_size": sum(f.size for f in content),
         "orphan_size": sum(f.size for f in files if not f.assoc),
         "orphan_content_size": sum(f.size for f in content if not f.assoc),
@@ -1894,33 +2058,65 @@ def _make_unit(upath, kind, files, root, release_path):
 
 
 def make_release(rpath, fl, min_content):
+    """A release + everything inside it that is worth its own search, at any depth:
+    - season folders, also inside a pack ('Show (2022)/Show S01-S05/Show S01/')
+    - multi-season packs and sub-releases ('Show S01-S05/', an album inside a discography)
+    - each movie of a collection ('American Pie/American.Pie.2.2001...mkv', 'Harry Potter/<one folder per film>/')
+    The release itself is searched too (complete series / collection torrents)."""
     root = fl[0].root
     rel = _make_unit(rpath, "release", fl, root, rpath)
+    rel["collection"] = False
     units = []
     if rel["is_dir"]:
-        subs = {}
+        direct, under, children = {}, {rpath: list(fl)}, {}
         for f in fl:
-            parts = os.path.relpath(f.path, rpath).split(os.sep)
-            if len(parts) > 1:
-                subs.setdefault(parts[0], []).append(f)
+            d = os.path.dirname(f.path)
+            direct.setdefault(d, []).append(f)
+            while d != rpath and d.startswith(rpath + "/"):
+                under.setdefault(d, []).append(f)
+                parent = os.path.dirname(d)
+                children.setdefault(parent, set()).add(d)
+                d = parent
         min_sub = max(min_content, 0.05 * rel["content_size"])
-        for name, sf in sorted(subs.items()):
-            p = Parsed(name)
-            if SEASON_DIR_RE.match(name) or p.se_kind == "season":
-                kind = "season"
-            elif GENERIC_DIR_RE.match(name):
-                continue
-            elif looks_release(name) or (" - " in name and any(file_kind(f.path) == "audio" for f in sf)):
-                kind = "sub"
-            else:
-                continue
-            u = _make_unit(os.path.join(rpath, name), kind, sf, root, rpath)
-            if u["orphan_content_size"] <= 0 or (kind == "sub" and u["content_size"] < min_sub):
-                continue
-            u.pop("_eps", None)
-            units.append(u)
+
+        def add(u):
+            if u["orphan_content_size"] > 0:
+                u.pop("_eps", None)
+                units.append(u)
+
+        def walk(d, anc, depth):
+            subs = [(c, under[c]) for c in sorted(children.get(d, ()))]
+            works = works_in(direct.get(d, []), subs, min_content)
+            work_dirs = set(w[0] for w in works if w[1])
+            if works and d == rpath:
+                rel["collection"] = True
+            for wpath, is_dir, wf in works:
+                if not is_dir:
+                    add(_make_unit(wpath, "work", wf, root, rpath, anc))
+            for c, sf in subs:
+                name = os.path.basename(c)
+                if GENERIC_DIR_RE.match(name):
+                    continue  # Screens/, Extras/, CD1/ belong to their parent
+                p = Parsed(name)
+                if c in work_dirs:
+                    kind = "work"
+                elif SEASON_DIR_RE.match(name) or p.se_kind == "season":
+                    kind = "season"
+                elif looks_release(name) or (" - " in name and any(file_kind(f.path) == "audio" for f in sf)):
+                    kind = "sub"
+                else:
+                    kind = None
+                if kind:
+                    u = _make_unit(c, kind, sf, root, rpath, anc)
+                    if not (kind == "sub" and u["content_size"] < min_sub):
+                        add(u)
+                if depth < 8:
+                    walk(c, [name] + anc, depth + 1)
+
+        walk(rpath, [rel["name"]], 0)
+        units.sort(key=lambda u: u["path"])
         seasons = sorted(set(u["se"][1] for u in units if u["kind"] == "season" and u["se"][1] is not None))
-        if rel["se"][0] is None and len(seasons) > 1:
+        if rel["se"][0] is None and len(seasons) > 1 and not rel["collection"]:
             rel["se"] = ["multi", None, None, seasons]
     rel["episodes"] = rel.pop("_eps")
     rel["units"] = units
@@ -2004,26 +2200,32 @@ def se_compat(tse, rp):
 
 
 class Target:
-    """Something on disk a torrent could be for: a release, a season folder, a sub-release or one episode file."""
+    """Something on disk a torrent could be for: a release, a collection, a season folder, a sub-release, one movie
+    of a collection or one episode file."""
 
-    def __init__(self, key, kind, path, unit, plist, se, sizes, media):
+    def __init__(self, key, kind, path, unit, plist, se, sizes, media, titles=None, inherit=(), pack=False):
         self.key, self.kind, self.path, self.unit, self.se, self.sizes, self.media = \
             key, kind, path, unit, se, sizes, media
+        self.pack = pack
         a = {}
         for k in ("year", "res_n", "source", "codec", "audio", "service", "group"):
             a[k] = next((getattr(p, k) for p in plist if getattr(p, k)), None)
+            if a[k] is None and k != "year":  # a movie of a collection doesn't get the collection's year
+                a[k] = next((getattr(p, k) for p in inherit if getattr(p, k)), None)
         a["cuts"] = next((p.cuts for p in plist if p.cuts), set())
         self.attrs = a
-        titles = []
-        for p in plist:
-            t = p.title or p.normalized
+        if titles is None:
+            titles = [p.title or p.normalized for p in plist]
+        out = []
+        for t in titles:
             if t and not SEASON_DIR_RE.match(t) and not GENERIC_DIR_RE.match(t):
-                titles.append(t)
-                titles.extend(alt_titles(t))
-        self.titles = list(dict.fromkeys(titles))
+                out.append(t)
+                out.extend(alt_titles(t))
+        self.titles = list(dict.fromkeys(out))
         lab = se_label(*se) if se and se[0] else None
-        self.label = {"release": "release", "season": "season", "sub": "sub-release",
-                      "episode": "episode"}.get(kind, kind) + (" " + lab if lab else "")
+        base = "collection" if pack else {"release": "release", "season": "season", "sub": "sub-release",
+                                          "episode": "episode", "work": "movie"}.get(kind, kind)
+        self.label = base + (" " + lab if lab else "")
 
     def tags(self):
         a = self.attrs
@@ -2034,20 +2236,39 @@ class Target:
         return " ".join(out)
 
 
+def _title_of(name):
+    p = Parsed(name)
+    t = p.title or p.normalized
+    return None if not t or SEASON_DIR_RE.match(t) or GENERIC_DIR_RE.match(name) else t
+
+
 def unit_target(rel, u):
-    names = [u["name"]]
-    if u.get("main") and os.path.basename(u["main"]) != u["name"]:
-        names.append(os.path.basename(u["main"]))
-    plist = [Parsed(n) for n in names]
-    if u["path"] != rel["path"]:
-        plist.append(Parsed(rel["name"]))  # season folders / sub-releases inherit the pack's tags
+    own = Parsed(u["name"])
+    plist, titles = [own], [_title_of(u["name"])]
+    pack = u["kind"] == "release" and bool(u.get("collection"))
+    main = os.path.basename(u["main"]) if u.get("main") else None
+    if main and u["is_dir"] and main != u["name"] and not pack:
+        plist.append(Parsed(main))  # 'Your Highness (2011)/Your.Highness.2011...D-Z0N3.mkv' has the tags
+        if looks_release(main):
+            titles.append(_title_of(main))
+    anc = [Parsed(n) for n in u.get("ancestors") or []]  # nearest first, up to the release
+    if u["kind"] != "work":
+        plist += anc  # season folders / sub-releases inherit the pack's tags and year
+    if u["kind"] in ("season", "sub") or not any(titles):
+        at = next((t for t in (_title_of(n) for n in u.get("ancestors") or []) if t), None)
+        if at:
+            titles.append(at)
+            if u["kind"] == "sub" and titles[0]:  # 'Pink Floyd' + '1977 - Animals' -> 'Pink Floyd Animals'
+                titles.append("%s %s" % (at, re.sub(r"^\s*(?:19|20)\d\d\s*", "", titles[0])))
     sizes = [("all files", u["total_size"])]
     if u["content_size"] and u["content_size"] != u["total_size"]:
         sizes.append(("without extras", u["content_size"]))
-    if (u["se"][0] not in ("season", "multi") and u.get("main_size") and u["main_size"] >= 0.6 * u["content_size"]
-            and u.get("main_orphan", True) and u["main_size"] not in [x[1] for x in sizes]):
+    if (u["se"][0] not in ("season", "multi") and not pack and u.get("main_size")
+            and u["main_size"] >= 0.6 * u["content_size"] and u.get("main_orphan", True)
+            and u["main_size"] not in [x[1] for x in sizes]):
         sizes.append(("main file only", u["main_size"]))
-    return Target(u["id"], u["kind"], u["path"], u, plist, u["se"], sizes, u["media"])
+    return Target(u["id"], u["kind"], u["path"], u, plist, u["se"], sizes, u["media"],
+                  titles=[t for t in titles if t], inherit=anc if u["kind"] == "work" else (), pack=pack)
 
 
 def episode_target(rel, e):
@@ -2119,20 +2340,20 @@ def assess(r, rp, t, cfg):
     why = tag_conflicts(t, rp, set(s.get("reject_on") or TAG_RULES))
     if why:
         return None, ", ".join(why), sm
+    tm = title_match(t.titles, t.attrs["year"], rp, pack=t.pack)
     sim = title_similarity(t.titles, rp)
-    strong = sm[0] in ("exact", "rounded")
-    need = float(s["min_title_similarity"] if strong else s["near_min_title_similarity"])
-    if sim < need:
-        return None, "title similarity %.2f<%.2f" % (sim, need), sm
+    if not tm and not (sm[0] == "exact" and sim >= float(s["min_title_similarity"])):
+        return None, "different title: %r vs %r" % ((t.titles or ["?"])[0], rp.title or rp.normalized), sm
     agree = tag_agreements(t, rp)
     if sm[0] == "near":
         pts = (2 if "group" in agree else 0) + sum(1 for k in ("res", "source", "codec") if k in agree)
         if pts < 2:
             return None, "size only near (%+.2f%%) and too few matching tags (%s)" % (
                 100 * sm[2], ",".join(agree) or "none"), sm
+    tsim = {"same": 1.0, "close": 0.9}.get(tm, sim)
     score = {"exact": 50.0, "rounded": 46.0, "close": 42.0}.get(sm[0]) or \
         max(20.0, 40.0 - 20.0 * abs(sm[2]) / thr)
-    score += 20.0 * sim
+    score += 20.0 * tsim
     score += 15 * ("group" in agree) + 4 * sum(1 for k in ("res", "source", "codec") if k in agree)
     score += 3 * ("audio" in agree) + 2 * ("year" in agree)
     if t.attrs["audio"] and rp.audio and t.attrs["audio"] != rp.audio:
@@ -2148,12 +2369,60 @@ def assess(r, rp, t, cfg):
         "info_hash": (r.get("infoHash") or "").lower() or None, "info_url": r.get("infoUrl"),
         "seeders": r.get("seeders"), "target": t.label,
         "size_match": sm[0], "size_target": sm[1], "size_diff": round(sm[2], 6),
-        "title_sim": sim, "agree": agree, "score": score,
+        "title_sim": tsim, "title_match": tm or "similar, exact size", "agree": agree, "score": score,
     }, None, sm
 
 
+HARD_RULES = ("season_episode", "year", "media")
+
+
+def extras_size_match(rsize, sizes, bigger, smaller):
+    """torrent a bit bigger (featurettes, extras, episodes you don't have) or a bit smaller than something of yours"""
+    if not rsize or rsize <= 0:
+        return None
+    best = None
+    for label, lsize in sizes:
+        if lsize > 0:
+            rel = (rsize - lsize) / float(lsize)
+            if -smaller <= rel <= bigger and (best is None or abs(rel) < abs(best[2])):
+                best = ("bigger" if rel > 0 else "smaller", label, rel)
+    return best
+
+
+def near_verdict(r, rp, t, cfg, reason, sm):
+    """A rejected result that is still worth a look (option 5) -> {kind, why, sm, title} or None.
+    Always: the SAME title (see title_match), year within 1, same season/episode, same media.
+    kind 'label': the size fits (exact / rounded / within 0.1%) but a tag rule said no - mislabeled uploads.
+    kind 'size' : nothing conflicts, but the torrent is up to near_miss_max_bigger_pct bigger (featurettes, extras,
+                  episodes you don't have) or near_miss_max_smaller_pct smaller than yours."""
+    s = cfg["search"]
+    tm = title_match(t.titles, t.attrs["year"], rp, pack=t.pack)
+    if not tm:
+        return None
+    rules = set(s.get("reject_on") or TAG_RULES)
+    if tag_conflicts(t, rp, rules & set(HARD_RULES)):
+        return None
+    soft = tag_conflicts(t, rp, rules - set(HARD_RULES))
+    if sm and sm[0] in ("exact", "rounded", "close"):
+        if len(soft) > 1 and sm[0] != "exact":
+            return None  # only a byte-identical size excuses several wrong labels at once
+        return {"kind": "label", "why": reason, "sm": sm, "title": tm}
+    if soft:
+        return None  # other size AND other label = another encode, not yours
+    ex = extras_size_match(r.get("size"), t.sizes, float(s.get("near_miss_max_bigger_pct", 20)) / 100.0,
+                           float(s.get("near_miss_max_smaller_pct", 5)) / 100.0)
+    if not ex:
+        return None
+    lsize = dict(t.sizes).get(ex[1], 0)
+    why = "same title, %s %s than yours (%s)" % (fmt_size(abs(r.get("size") - lsize)), ex[0], ex[1])
+    why += " - extras / files you don't have?" if ex[0] == "bigger" else " - files the torrent doesn't have?"
+    if sm and sm[0] == "near":
+        why += " | step 2: %s" % reason
+    return {"kind": "size", "why": why, "sm": ex, "title": tm}
+
+
 def evaluate_result(r, targets, ep_targets, cfg, qhashes):
-    """-> (best candidate, its target) or (None, None) plus a list of (target, reason) near misses and a log reason"""
+    """-> (best candidate, its target, near misses [(target, near verdict)], log reason)"""
     rp = Parsed(r.get("title") or "")
     ih = (r.get("infoHash") or "").lower()
     if ih and ih in qhashes:
@@ -2163,25 +2432,30 @@ def evaluate_result(r, targets, ep_targets, cfg, qhashes):
     tl = list(targets)
     if rp.se_kind == "episode":
         tl += ep_targets.get((rp.season_n, rp.episode_n), [])
-    best, best_t, near = None, None, []
+    best, best_t, near, whys = None, None, [], []
     for t in tl:
         c, why, sm = assess(r, rp, t, cfg)
-        if c and (best is None or c["score"] > best["score"]):
-            best, best_t = c, t
-        elif not c and sm:
-            near.append((t, why, sm))
+        if c:
+            if best is None or c["score"] > best["score"]:
+                best, best_t = c, t
+            continue
+        if sm:
+            whys.append("%s: %s" % (t.label, why))
+        nv = near_verdict(r, rp, t, cfg, why, sm)
+        if nv:
+            near.append((t, nv))
     if best:
-        return best, best_t, near, None
-    if near:
-        return None, None, near, "; ".join("%s: %s" % (t.label, why) for t, why, sm in near[:3])
+        return best, best_t, [], None
+    if whys:
+        return None, None, near, "; ".join(whys[:3])
     sizes = ", ".join("%s %s" % (t.label, fmt_size(t.sizes[0][1])) for t in tl[:4])
-    return None, None, [], "no size match (%s vs %s)" % (fmt_size(r.get("size")), sizes)
+    return None, None, near, "no size match (%s vs %s)" % (fmt_size(r.get("size")), sizes)
 
 
 def unit_item(rel, t):
     """The dict step 3/4 work with: the unit plus its files, 'rel' relative to the unit's parent folder."""
     upath = t.path
-    if t.kind == "episode":
+    if not t.unit.get("is_dir"):
         files = [f for f in rel["files"] if f["path"] == upath]
     elif upath == rel["path"]:
         files = rel["files"]
@@ -2197,7 +2471,7 @@ def unit_item(rel, t):
 
 def release_search_names(rel):
     names = [rel["name"]]
-    if rel.get("main"):
+    if rel.get("main") and not rel.get("collection"):
         fname = os.path.basename(rel["main"])
         p = Parsed(fname)
         a, b = title_tokens(p.title), title_tokens(Parsed(rel["name"]).title)
@@ -2212,7 +2486,7 @@ def step_search(cfg, paths, prow=None, qb=None):
     data = read_json(paths.orphans_json)
     if not data:
         raise Fatal("no %s - run step 1 first" % paths.orphans_json)
-    if data.get("version") != 2:
+    if data.get("version") != 3:
         raise Fatal("%s is from the old version of this script - run step 1 again" % paths.orphans_json)
     s = cfg["search"]
     skip_res = [re.compile(x, re.I) for x in s.get("skip_items_regex") or []]
@@ -2271,10 +2545,6 @@ def step_search(cfg, paths, prow=None, qb=None):
                 seen[k] = r
                 new += 1
                 c, t, nm, why = evaluate_result(r, targets, ep_targets, cfg, qhashes)
-                for nt, nwhy, nsm in nm:
-                    tmap.setdefault(nt.key, nt)
-                    near.setdefault(nt.key, []).append({"indexer": r.get("indexer"), "title": r.get("title"),
-                                                        "size": r.get("size"), "why": nwhy})
                 if c:
                     c["query"] = q
                     tmap.setdefault(t.key, t)
@@ -2285,14 +2555,20 @@ def step_search(cfg, paths, prow=None, qb=None):
                         c["indexer"], c["title"], t.label))
                 else:
                     LOG.file("   - [%s] %s (%s): %s" % (r.get("indexer"), r.get("title"), fmt_size(r.get("size")), why))
-                    if nm:  # right size for something of yours, rejected by a rule -> near miss (option 5)
-                        nt, nwhy, nsm = min(nm, key=lambda x: (SIZE_RANK.get(x[2][0], 9), abs(x[2][2])))
+                    if nm:  # same title, and the size fits but a label differs / the size is off by extras
+                        nt, nv = min(nm, key=lambda x: near_rank(x[1]))
+                        tmap.setdefault(nt.key, nt)
+                        near.setdefault(nt.key, []).append({"indexer": r.get("indexer"), "title": r.get("title"),
+                                                            "size": r.get("size"), "why": nv["why"]})
+                        LOG.debug("   ~ near miss (%s, title %s) [%s] %s -> %s: %s" % (
+                            nv["kind"], nv["title"], r.get("indexer"), r.get("title"), nt.label, nv["why"]))
                         nms.append({"key": k, "indexer": r.get("indexer"), "indexer_id": r.get("indexerId"),
                                     "title": r.get("title"), "size": r.get("size"), "guid": r.get("guid"),
                                     "download_url": r.get("downloadUrl"), "magnet_url": r.get("magnetUrl"),
-                                    "info_url": r.get("infoUrl"), "target": nt.label, "why": nwhy,
-                                    "size_match": nsm[0], "size_target": nsm[1], "size_diff": round(nsm[2], 6),
-                                    "also": ["%s: %s" % (x[0].label, x[1]) for x in nm if x[0] is not nt][:3],
+                                    "info_url": r.get("infoUrl"), "target": nt.label, "target_key": nt.key,
+                                    "near_kind": nv["kind"], "title_match": nv["title"], "why": nv["why"],
+                                    "size_match": nv["sm"][0], "size_target": nv["sm"][1],
+                                    "size_diff": round(nv["sm"][2], 6),
                                     "release": rel["path"], "query": q, "item": unit_item(rel, nt)})
             qlog.append({"query": q, "variant": kind, "for": owner, "results": len(res), "new": new, "cached": cached})
             b = max(best.values() or [0])
@@ -2302,8 +2578,10 @@ def step_search(cfg, paths, prow=None, qb=None):
                 else ""))
             return len(res)
 
-        for q, kind in build_queries(release_search_names(rel), cfg)[:maxq]:
-            run(q, kind, "release")
+        coll = bool(rel.get("collection"))
+        for q, kind in build_queries(release_search_names(rel), cfg, variants=s.get("sub_unit_variants") if coll
+                                     else None)[:subq if coll else maxq]:
+            run(q, kind, targets[0].label)
             if best.get(targets[0].key, 0) >= stop_at:
                 break
         rtitle = Parsed(rel["name"]).title
@@ -2311,16 +2589,30 @@ def step_search(cfg, paths, prow=None, qb=None):
             if best.get(t.key, 0) >= stop_at:
                 continue
             u = t.unit
-            if SEASON_DIR_RE.match(u["name"]):
-                names = ["%s S%02d" % (rtitle, u["se"][1])]
-            else:
+            if u["kind"] == "work":  # one movie of a collection: searched like a release of its own
                 names = [u["name"]]
-            for q, kind in build_queries(names, cfg, variants=s.get("sub_unit_variants"))[:subq]:
+                main = os.path.basename(u["main"]) if u.get("main") else None
+                if u["is_dir"] and main and main != u["name"] and looks_release(main):
+                    names.append(main)
+                qs = build_queries(names, cfg)[:maxq]
+            else:
+                if SEASON_DIR_RE.match(u["name"]):
+                    names = ["%s S%02d" % (rtitle, u["se"][1])]
+                else:
+                    names = [u["name"]]
+                qs = build_queries(names, cfg, variants=s.get("sub_unit_variants"))[:subq]
+            for q, kind in qs:
                 if q.lower() in done:
                     continue
                 run(q, kind, t.label)
                 if best.get(t.key, 0) >= stop_at:
                     break
+        per_t, kept = {}, []
+        for m in sorted(nms, key=lambda m: near_rank(m)):
+            per_t[m["target_key"]] = per_t.get(m["target_key"], 0) + 1
+            if per_t[m["target_key"]] <= int(s.get("near_misses_per_target", 3)):
+                kept.append(m)
+        nms = kept
         units_out = []
         for key in list(dict.fromkeys(list(cands.keys()) + list(near.keys()))):
             t = tmap[key]
@@ -2335,7 +2627,7 @@ def step_search(cfg, paths, prow=None, qb=None):
                     c["score"], c["size_match"], 100 * c["size_diff"], ",".join(c["agree"]) or "-", c["indexer"],
                     c["title"], fmt_size(c["size"]), u["label"])))
         if not ncand:
-            closest = [(u["label"], r) for u in units_out for r in u["rejected_same_size"]][:2]
+            closest = [(u["label"], r) for u in units_out for r in u["rejected_same_size"]][:2]  # near misses
             LOG.info(LOG.c("dim", "   => no match (%d results checked)%s" % (
                 len(seen), "".join("\n      closest: [%s] %s -> %s: %s" % (r["indexer"], r["title"], lab, r["why"])
                                    for lab, r in closest))))
@@ -2353,13 +2645,22 @@ def step_search(cfg, paths, prow=None, qb=None):
     nc = sum(len(u["candidates"]) for x in out for u in x["units"])
     nr = sum(1 for x in out if any(u["candidates"] for u in x["units"]))
     nn = sum(len(x.get("near_misses") or []) for x in out)
-    LOG.ok("%d candidates for %d of %d releases (%d live searches, rest from cache); %d near misses (right size, "
-           "rejected by a rule) -> option 5" % (nc, nr, len(out), total_live, nn))
+    LOG.ok("%d candidates for %d of %d releases (%d live searches, rest from cache); %d near misses (same title, "
+           "other label or size off by extras) -> option 5" % (nc, nr, len(out), total_live, nn))
     LOG.info("-> %s\n-> %s\n-> %s" % (paths.cand_txt, paths.cand_json, paths.near_txt))
     return out
 
 
-SIZE_RANK = {"exact": 0, "rounded": 1, "close": 2, "near": 3}
+SIZE_RANK = {"exact": 0, "rounded": 1, "close": 2, "near": 3, "bigger": 4, "smaller": 5}
+
+
+def near_rank(m):
+    """best near misses first: size fits + other label, then same title before close title, then smallest difference"""
+    kind = m.get("near_kind") or m.get("kind")
+    sm0 = m["sm"][0] if "sm" in m else m["size_match"]
+    diff = m["sm"][2] if "sm" in m else m["size_diff"]
+    return (0 if kind == "label" else 1, 0 if (m.get("title_match") or m.get("title")) == "same" else 1,
+            SIZE_RANK.get(sm0, 9), abs(diff))
 
 
 def target_size(item, label):
@@ -2371,15 +2672,26 @@ def target_size(item, label):
     return item.get("total_size")
 
 
+def near_line(m):
+    if m.get("near_kind") == "size":
+        return "size %s %+.1f%% vs %s" % (m["size_match"], 100 * m["size_diff"], m["size_target"])
+    return "size %s %+.3f%% vs %s" % (m["size_match"], 100 * m["size_diff"], m["size_target"])
+
+
 def save_near_misses(paths, out, partial):
     nml = [m for x in out for m in (x.get("near_misses") or [])]
-    nml.sort(key=lambda m: (m["release"].lower(), SIZE_RANK.get(m["size_match"], 9), abs(m["size_diff"])))
+    nml.sort(key=lambda m: (m["release"].lower(), m["item"]["path"].lower(), near_rank(m)))
     for i, m in enumerate(nml, 1):
         m["no"] = i
-    write_json(paths.near_json, {"generated": now_iso(), "complete": not partial, "near_misses": nml})
-    lines = ["# near misses: the SIZE fits something of yours, but step 2 rejected the result for the reason shown.",
+    write_json(paths.near_json, {"version": 3, "generated": now_iso(), "complete": not partial, "near_misses": nml})
+    lines = ["# near misses: results with the SAME TITLE as something of yours (same year, same season/episode) that",
+             "# step 2 still rejected because",
+             "#   LABEL: the size fits, but a label differs (720p vs 1080p, other group...) - mislabeled uploads", 
+             "#   SIZE : nothing conflicts, but the torrent is a bit bigger (featurettes, extras, episodes you don't",
+             "#          have) or smaller than yours",
              "# Menu option 5 downloads + checks them (one by one, all at once, or by number) and adds the ones whose",
-             "# pieces really are your data. Anything failing the piece check is never added.",
+             "# pieces really are your data (missing extras get downloaded when you Start). Anything failing the",
+             "# piece check is never added.",
              "# generated %s%s" % (now_iso(), ", INCOMPLETE" if partial else ""), ""]
     cur = None
     for m in nml:
@@ -2387,12 +2699,14 @@ def save_near_misses(paths, out, partial):
             cur = m["release"]
             lines.append(cur)
         it = m["item"]
-        where = "" if it["path"] == m["release"] else "  %s" % os.path.relpath(it["path"], m["release"])
-        lines.append("  #%-4d %-7s %+8.3f%%  [%s] %s  (%s)" % (m["no"], m["size_match"], 100 * m["size_diff"],
-                                                               m["indexer"], m["title"], fmt_size(m["size"])))
-        lines.append("        aims at: %s%s  (%s: %s)" % (m["target"], where, m["size_target"],
-                                                          fmt_size(target_size(it, m["size_target"]))))
-        lines.append("        rejected: %s" % m["why"])
+        where = "" if it["path"] == m["release"] else "  %s%s" % (os.path.relpath(it["path"], m["release"]),
+                                                                   "/" if it.get("is_dir") else "")
+        lines.append("  #%-4d %-5s [%s] %s  (%s)" % (m["no"], (m.get("near_kind") or "label").upper(), m["indexer"],
+                                                    m["title"], fmt_size(m["size"])))
+        lines.append("        aims at: %s%s  (%s: %s)   %s, title %s" % (
+            m["target"], where, m["size_target"], fmt_size(target_size(it, m["size_target"])), near_line(m),
+            m.get("title_match") or "?"))
+        lines.append("        %s: %s" % ("rejected" if m.get("near_kind") != "size" else "why", m["why"]))
     if not nml:
         lines.append("(none)")
     write_text(paths.near_txt, lines)
@@ -2400,13 +2714,13 @@ def save_near_misses(paths, out, partial):
 
 def save_candidates(paths, out, partial, show=5):
     save_near_misses(paths, out, partial)
-    write_json(paths.cand_json, {"version": 2, "generated": now_iso(), "complete": not partial, "releases": out})
+    write_json(paths.cand_json, {"version": 3, "generated": now_iso(), "complete": not partial, "releases": out})
     lines = ["# possible matches for orphan releases  (generated %s%s)" % (now_iso(), ", INCOMPLETE" if partial else ""),
              "# score = size (50 exact, 46 within the indexer's rounding, 42 within 0.1%, 20-40 near) + 20 x title sim.",
              "#         + 15 same group + 4 each same res/source/codec + 3 audio + 2 year",
              "# a result is rejected when group, codec, source, resolution, streaming service, edition, year or",
-             "# season/episode CONFLICT (missing tags on either side are fine). Rejected-but-same-size results are",
-             "# listed with the reason so you can see what almost matched.", ""]
+             "# season/episode CONFLICT (missing tags on either side are fine), or when the TITLE differs.",
+             "# '~ near miss' = same title, but a label differs or the size is off by extras -> option 5.", ""]
     for x in out:
         r = x["release"]
         lines.append("%s%s  (%s, %s, %s)" % (r["path"], "/" if r["is_dir"] else "", fmt_size(r["orphan_size"]),
@@ -2431,10 +2745,10 @@ def save_candidates(paths, out, partial, show=5):
         for u, rj in near[:show]:
             it = u["item"]
             where = "" if it["path"] == r["path"] else " %s" % os.path.relpath(it["path"], r["path"])
-            lines.append("      x  same size but rejected -> %s%s: [%s] %s (%s) - %s" % (
+            lines.append("      ~  near miss -> %s%s: [%s] %s (%s) - %s" % (
                 u["label"], where, rj["indexer"], rj["title"], fmt_size(rj["size"]), rj["why"]))
         if len(near) > show:
-            lines.append("      x  ... %d more same-size rejections (see the log)" % (len(near) - show))
+            lines.append("      ~  ... %d more near misses (near_misses.txt)" % (len(near) - show))
         if not any_c:
             lines.append("   => no match (%d results checked)" % x["results_seen"])
         lines.append("")
@@ -2602,7 +2916,9 @@ def spot_check(t, mapping, n):
                                               if bad else "ok")
 
 
-def verify_torrent(t, item, cfg):
+def verify_torrent(t, item, cfg, min_ratio=None):
+    """min_ratio: share of the torrent's bytes that must exist locally for 'partial' (default
+    download.partial_min_ratio; near misses that are bigger by extras use a lower one)"""
     m = match_tree(t, item)
     mapping = m["mapping"]
     nz = [f for f in t.files if f.size > 0]
@@ -2612,7 +2928,7 @@ def verify_torrent(t, item, cfg):
     renamed_existing = [r for r in plan["renames"] if r[0] in mapping]
     if all_matched:
         status = "exact" if not renamed_existing else "renamed"
-    elif ratio >= float(cfg["download"]["partial_min_ratio"]):
+    elif ratio >= float(cfg["download"]["partial_min_ratio"] if min_ratio is None else min_ratio):
         status = "partial"
     else:
         status = "mismatch"
@@ -2655,10 +2971,10 @@ class Fetcher:
 
     def fetch(self, c, it, extra=None):
         """-> the downloads.json record for this result (also saved)"""
-        cfg, paths = self.cfg, self.paths
+        paths = self.paths
         rec = {"key": c["key"], "item_id": it["id"], "item_path": it["path"], "indexer": c["indexer"],
                "title": c["title"], "score": c.get("score"), "time": now_iso(), "candidate": c, "item": it}
-        rec.update(extra or {})
+        rec.update(extra or {})  # near misses carry their own 'partial' threshold (min_ratio) into step 4
 
         def store(**kw):
             rec.update(kw)
@@ -2710,17 +3026,21 @@ class Fetcher:
             LOG.warn("   same torrent hash already downloaded via another result")
             return store(status="duplicate")
         self.got_hashes[t.hash] = c["key"]
-        status, ratio, mapping, plan = verify_torrent(t, it, cfg)
-        ok, checked, detail = (None, 0, "no files matched")
-        if status != "mismatch":
+        return store(**self.check(t, it, (extra or {}).get("min_ratio")))
+
+    def check(self, t, it, min_ratio=None):
+        """file tree + real piece hashes vs your files -> fields for the downloads.json record"""
+        status, ratio, mapping, plan = verify_torrent(t, it, self.cfg, min_ratio)
+        ok, checked, detail = (None, 0, "nothing of yours in it")
+        if mapping:
             try:
-                ok, checked, detail = spot_check(t, mapping, int(cfg["download"]["verify_pieces"]))
+                ok, checked, detail = spot_check(t, mapping, int(self.cfg["download"]["verify_pieces"]))
             except OSError as e:
                 ok, checked, detail = False, 0, "read error: %s" % e
         for line in mapping_lines(t, mapping):
             LOG.info(line)
         tree_status = status
-        if ok is False:
+        if ok is False and status != "mismatch":
             status = "bad_pieces"  # same sizes, different bytes: not your files
         col = {"exact": "green", "renamed": "green", "partial": "yellow"}.get(status, "red")
         pc = "pieces %d/%d OK" % (checked, checked) if ok else ("PIECE CHECK FAILED: %s" % detail if ok is False
@@ -2729,14 +3049,35 @@ class Fetcher:
                        % (status.upper() if status == tree_status else "%s (file tree looked %s)" % (
                            status.upper(), tree_status), fmt_pct(ratio),
                           len([r for r in plan["renames"] if r[0] in mapping]), len(plan["missing"]), pc)))
+        if status == "mismatch" and ok:
+            LOG.info("   (your file%s inside it check out, but %s of the torrent is missing here - below the %s "
+                     "needed for 'partial')" % ("s" if len(mapping) > 1 else "", fmt_pct(1 - ratio), fmt_pct(
+                         float(self.cfg["download"]["partial_min_ratio"] if min_ratio is None else min_ratio))))
         for idx, old, new in plan["renames"][:6]:
             LOG.debug("      rename %s -> %s" % (old, new))
         for cf in plan["conflicts"]:
             LOG.warn("   conflict: %s" % cf)
-        return store(status=status, tree_status=tree_status, matched_ratio=round(ratio, 5), piece_check=ok,
-                     pieces_checked=checked, piece_detail=detail, savepath=plan.get("savepath"),
-                     renames=[list(r) for r in plan["renames"]], missing=[list(r) for r in plan["missing"]],
-                     conflicts=plan["conflicts"], mapping={str(k): v["path"] for k, v in mapping.items()})
+        return dict(status=status, tree_status=tree_status, matched_ratio=round(ratio, 5), piece_check=ok,
+                    pieces_checked=checked, piece_detail=detail, savepath=plan.get("savepath"),
+                    renames=[list(r) for r in plan["renames"]], missing=[list(r) for r in plan["missing"]],
+                    conflicts=plan["conflicts"], mapping={str(k): v["path"] for k, v in mapping.items()})
+
+    def recheck(self, rec, it, min_ratio=None):
+        """a .torrent downloaded earlier: check it again under the current rules (no second grab)"""
+        t = Torrent(open(rec["torrent_file"], "rb").read())
+        LOG.info("   using the .torrent downloaded before: %s" % os.path.basename(rec["torrent_file"]))
+        LOG.info("   inside: %s%s  (%d file%s, %s, hash %s)" % (t.name, "/" if t.multi else "", len(t.files),
+                                                              "" if len(t.files) == 1 else "s", fmt_size(t.size),
+                                                              t.hash[:12]))
+        rec = dict(rec, item=it, item_id=it["id"], item_path=it["path"], time=now_iso(), min_ratio=min_ratio)
+        if t.hash in self.qhashes:
+            LOG.warn("   this exact torrent is already in qBittorrent")
+            rec["status"] = "already_in_qbit"
+        else:
+            rec.update(self.check(t, it, min_ratio))
+        self.dls[rec["key"]] = rec
+        save_downloads(self.paths, self.dls)
+        return rec
 
 
 def mapping_lines(t, mapping, maxlines=4):
@@ -2766,7 +3107,7 @@ def step_download(cfg, paths, prow=None, qb=None, yes=False):
         raise Fatal("no %s - run step 2 first" % paths.cand_json)
     if not data.get("complete", True):
         LOG.warn("candidates.json is from an interrupted search - using what is there")
-    if data.get("version") != 2:
+    if data.get("version") != 3:
         raise Fatal("%s is from the old version of this script - run steps 1 and 2 again" % paths.cand_json)
     dls_before = read_json(paths.dl_json, {}) or {}
     min_score = float(cfg["download"]["min_score"])
@@ -3015,7 +3356,7 @@ class Adder:
             raw = fh.read()
         t = Torrent(raw)
         item = v["item"]
-        status, ratio, mapping, plan = verify_torrent(t, item, cfg)  # re-verify: files may have moved since
+        status, ratio, mapping, plan = verify_torrent(t, item, cfg, v.get("min_ratio"))  # files may have moved
         LOG.info("   [%s] %s  (%s%d file%s, %s)  hash %s  -> %s" % (
             v.get("indexer"), t.name, "folder, " if t.multi else "", len(t.files), "" if len(t.files) == 1 else "s",
             fmt_size(t.size), t.hash[:12], status.upper()))
@@ -3287,10 +3628,12 @@ def near_aims_at(m):
 
 
 def step_nearmiss(cfg, paths, yes=False):
-    LOG.info(LOG.c("bold", "\n=== 5) try near misses - right size, rejected by a rule in step 2 ==="))
+    LOG.info(LOG.c("bold", "\n=== 5) try near misses - same title, rejected in step 2 for a label or the size ==="))
     data = read_json(paths.near_json)
     if not data:
         raise Fatal("no %s - run step 2 first" % paths.near_json)
+    if data.get("version") != 3:
+        raise Fatal("%s is from the old version of this script - run steps 1 and 2 again" % paths.near_json)
     nms = data["near_misses"]
     dls = read_json(paths.dl_json, {}) or {}
     tried = {m["no"] for m in nms if (dls.get(m["key"]) or {}).get("status") not in (None, "error", "ratelimit",
@@ -3328,14 +3671,19 @@ def step_nearmiss(cfg, paths, yes=False):
     ad = Adder(cfg, paths, qb=qb, approve_all=not one_by_one)
     by_no = {m["no"]: m for m in nms}
     res = {}
+    # a near miss that is bigger by extras / episodes you don't have is fine as 'partial' as long as the part that IS
+    # on your disk passes the piece check (Start then downloads only the rest)
+    min_ratio = min(float(cfg["download"]["partial_min_ratio"]),
+                    1.0 / (1.0 + float(cfg["search"].get("near_miss_max_bigger_pct", 20)) / 100.0) - 0.001)
     for n, no in enumerate(sel, 1):
         m = by_no[no]
         LOG.info(LOG.c("bold", "[%d/%d] near miss #%d  [%s] %s  (%s)" % (n, len(sel), no, m["indexer"], m["title"],
                                                                       fmt_size(m["size"]))))
         for line in near_aims_at(m):
             LOG.info(line)
-        LOG.info("   size %s %+.3f%% vs %s | rejected in step 2: %s" % (m["size_match"], 100 * m["size_diff"],
-                                                                     m["size_target"], m["why"]))
+        LOG.info("   %s | title %s | %s: %s" % (near_line(m), m.get("title_match") or "?",
+                                              "rejected in step 2" if m.get("near_kind") != "size" else "near miss",
+                                              m["why"]))
         if no in tried:
             LOG.info(LOG.c("dim", "   tried before: %s" % dls[m["key"]].get("status")))
         if one_by_one:
@@ -3354,16 +3702,10 @@ def step_nearmiss(cfg, paths, yes=False):
         prev = fe.done_before(m["key"])
         if prev and os.path.exists(prev.get("torrent_file") or ""):
             # no second download (private trackers count every .torrent grab) - re-check the one we have
-            LOG.info("   using the .torrent downloaded before: %s" % os.path.basename(prev["torrent_file"]))
-            rec = prev
-            t_prev = Torrent(open(prev["torrent_file"], "rb").read())
-            st, ratio, mapping, plan = verify_torrent(t_prev, m["item"], cfg)
-            for line in mapping_lines(t_prev, mapping):
-                LOG.info(line)
-            LOG.info("   => before: %s%s" % (prev.get("status", "?").upper(), "" if prev.get("piece_check") is not False
-                                            else " (%s)" % prev.get("piece_detail")))
+            rec = fe.recheck(dict(prev, near_miss=True, near_reason=m["why"], near_no=no), m["item"], min_ratio)
         else:
-            rec = fe.fetch(c, m["item"], extra={"near_miss": True, "near_reason": m["why"], "near_no": no})
+            rec = fe.fetch(c, m["item"], extra={"near_miss": True, "near_reason": m["why"], "near_no": no,
+                                                "min_ratio": min_ratio})
         why = ad.why_not(rec)
         if why:
             LOG.info(LOG.c("dim", "   not added: %s" % why))
@@ -3659,7 +4001,7 @@ def main():
         print("  2) search Prowlarr for orphans -> possible matches    %s" % st[1])
         print("  3) download .torrent files (approve) + verify         %s" % st[2])
         print("  4) add to qBittorrent (stopped, hardlink if needed)  %s" % st[3])
-        print("  5) try near misses (right size, rejected by a rule)   %s" % st[4])
+        print("  5) try near misses (same title, other label / extras)   %s" % st[4])
         print("  t) test connections    d) debug output: %s    q) quit" % ("ON" if LOG.debug_console else "off"))
         print(LOG.c("dim", "  output: %s" % paths.work))
         try:
