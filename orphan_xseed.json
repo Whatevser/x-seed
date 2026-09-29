@@ -1,0 +1,155 @@
+{
+  "_help": "orphan_xseed.py config. Keys starting with '_' are comments and are ignored. All paths are as seen from the machine that runs the script.",
+  "work_dir": "./orphan_xseed_data",
+  "_work_dir_help": "Where lists, .torrent files, cache and logs go. Relative = relative to this config file.",
+  "debug": false,
+  "qbittorrent": {
+    "url": "http://192.168.10.2:8080/",
+    "username": "Roman",
+    "password": "",
+    "api_key": "",
+    "_api_key_help": "qBittorrent 5.2+ only (Options > WebUI > API key, starts with qbt_). If set it is used instead of username/password. Leave empty to log in normally.",
+    "timeout_sec": 180,
+    "verify_ssl": false
+  },
+  "prowlarr": {
+    "url": "http://192.168.10.2:9696/",
+    "username": "roman",
+    "password": "",
+    "api_key": "",
+    "_api_key_help": "Leave empty: the script logs in with username/password and reads the key from /initialize.json. Or paste it from Prowlarr > Settings > General > API Key.",
+    "indexer_ids": [
+      -2
+    ],
+    "_indexer_ids_help": "-2 = all torrent indexers. Or list Prowlarr indexer ids, e.g. [1, 4, 7] (menu option t prints them).",
+    "categories": [],
+    "_categories_help": "Newznab category ids to restrict searches, e.g. [2000, 5000]. Empty = all.",
+    "search_limit": 100,
+    "search_timeout_sec": 180,
+    "delay_between_searches_sec": 2,
+    "cache_hours": 24,
+    "_cache_hours_help": "Identical searches are answered from search_cache.json for this long, so re-running step 2 after tweaking matching settings does not hammer indexers. 0 = off."
+  },
+  "scan": {
+    "paths": [
+      "/media/roman/hdd16/Torrent/Download/",
+      "/media/roman/DiskQ/Torrent/Download/",
+      "/media/roman/DiskM/Torrent/Download/",
+      "/media/roman/DiskL/Torrent/Download/"
+    ],
+    "path_mappings": [],
+    "_path_mappings_help": "Only needed if qBittorrent sees the files under different paths than this machine (docker, NFS...). Example: [{\"qbit\": \"/downloads\", \"local\": \"/media/roman/hdd16/Torrent/Download\"}]",
+    "ignore_extensions": [
+      ".!qb",
+      ".part",
+      ".parts",
+      ".tmp",
+      ".crdownload"
+    ],
+    "ignore_names": [
+      "Thumbs.db",
+      ".DS_Store",
+      "desktop.ini"
+    ],
+    "ignore_dirs": [
+      ".Trash-1000",
+      "lost+found",
+      "@eaDir",
+      ".stfolder",
+      ".stversions",
+      "$RECYCLE.BIN"
+    ],
+    "container_dir_names": [],
+    "_container_dir_names_help": "Folder names that only hold other releases (e.g. \"radarr\", \"tv-sonarr\"). Folders used as torrent save paths / category paths are detected automatically.",
+    "auto_container_names": true,
+    "_auto_container_names_help": "Treat folders named like categories (Movies, Shows, TV, Music Videos, radarr, sonarr...) and folders that only hold release folders as containers.",
+    "min_orphan_content_mb": 20,
+    "_min_orphan_content_mb_help": "A release counts as orphan only if at least this much real content (video/audio/other, not nfo/srt/jpg/samples) is unseeded. Releases with only extras unseeded go to orphan_extras.txt.",
+    "min_file_size_mb": 0,
+    "name_size_fallback": true,
+    "_name_size_fallback_help": "If a torrent's file can't be found on disk from here, a local file with the same file name + size counts as belonging to that torrent (listed in weak_matches.txt).",
+    "follow_symlinks": false
+  },
+  "search": {
+    "variants": [
+      "title_year",
+      "title_group",
+      "alt",
+      "dotted",
+      "no_spaces",
+      "title",
+      "clean",
+      "raw",
+      "title_year_res"
+    ],
+    "_variants_help": "Query builders for a release, tried in this order until max_queries_per_item. title_year: 'Title 2020' / 'Show S01'; title_group: 'Title TiZU' (release group - same group is what cross-seeding needs); alt: '&'<->'and', no apostrophes, no leading 'The', each side of 'aka'; dotted: 'Title.2020'; no_spaces: 'TitleWords 2020'; title: title alone; clean: full name minus HDR/DV/codec/audio/source junk; raw: the name with separators as spaces; title_year_res: + 1080p.",
+    "max_queries_per_item": 5,
+    "_max_queries_per_item_help": "Each query hits every indexer in Prowlarr - mind tracker API limits. A release stops searching once it has a match scoring stop_when_score_at_least.",
+    "sub_unit_variants": [
+      "title_year",
+      "title_group"
+    ],
+    "max_queries_per_sub_unit": 2,
+    "_sub_unit_help": "Season folders / sub-releases inside a release that are still unmatched get their own queries ('Merlin S01', 'Merlin S01 TiZU').",
+    "max_items": 0,
+    "_max_items_help": "Search at most this many orphan releases per run, biggest first. 0 = all.",
+    "reject_on": [
+      "season_episode",
+      "resolution",
+      "source",
+      "codec",
+      "group",
+      "service",
+      "edition",
+      "year",
+      "media"
+    ],
+    "_reject_on_help": "A result is dropped when one of these CONFLICTS between your release and the result (a tag missing on either side never rejects). Remove an entry to relax that rule.",
+    "fuzzy_size_threshold": 0.02,
+    "_fuzzy_size_threshold_help": "'near' size window (+-2%). Near-size results additionally need a similar title and matching group or 2 of res/source/codec. Exact sizes and sizes within the indexer's display rounding ('29.05 GB') always count as exact.",
+    "close_size_threshold": 0.001,
+    "_close_size_threshold_help": "Within 0.1% (e.g. the torrent has an nfo you deleted) counts as 'close': accepted on title + no conflicting tags, for *arr-renamed files that have no tags left to compare. Step 3's piece check has the final word.",
+    "min_title_similarity": 0.6,
+    "near_min_title_similarity": 0.75,
+    "min_score": 55,
+    "stop_when_score_at_least": 85,
+    "max_candidates_per_item": 8,
+    "skip_items_regex": [],
+    "show_rejected_per_item": 3
+  },
+  "download": {
+    "min_score": 0,
+    "delay_between_downloads_sec": 2,
+    "verify_pieces": 4,
+    "_verify_pieces_help": "How many pieces to SHA1-check against your files after downloading a .torrent. 0 = off. Only pieces fully covered by matched files are checked.",
+    "partial_min_ratio": 0.98,
+    "_partial_min_ratio_help": "A torrent where only this share of its bytes exist locally is 'partial'. Below this it is a 'mismatch' and never added."
+  },
+  "add": {
+    "allowed_statuses": [
+      "exact",
+      "renamed",
+      "partial"
+    ],
+    "require_piece_check": true,
+    "_require_piece_check_help": "Only add torrents whose spot-checked pieces all matched.",
+    "skip_checking": true,
+    "start_stopped": true,
+    "category": "",
+    "tags": [
+      "orphan-xseed"
+    ],
+    "tag_with_status": true,
+    "_tag_with_status_help": "Adds oxs-exact / oxs-renamed / oxs-partial tag so you can filter in qBittorrent.",
+    "link_dir": "{drive}/hardlinked/xseed",
+    "_link_dir_help": "Hardlink folder for torrents whose layout doesn't fit your files (see link_dir_mode). {drive} = mount point of the disk your file is on, e.g. /media/roman/DiskM -> /media/roman/DiskM/hardlinked/xseed. Must be on the same disk (hardlinks).",
+    "link_dir_mode": "auto",
+    "_link_dir_mode_help": "auto: use the hardlink folder when the torrent is a folder but you have a single file, or the torrent has files you don't have (nfo/screens/sample get downloaded there, not into your library). Single-file torrents and folders that match yours point at your files directly. all: every folder torrent that isn't an exact match. off: never.",
+    "link_dir_download_missing": true,
+    "_link_dir_download_missing_help": "Files you don't have stay wanted, so Start downloads them into the hardlink folder. false = set them to 'do not download'.",
+    "temp_hardlinks": true,
+    "_temp_hardlinks_help": "For 'renamed' torrents: briefly hardlink your files under the torrent's names so qBittorrent accepts skip_checking (100%, no 'missing files'), then remove the links and rename inside qBittorrent onto your names. No data is copied or moved.",
+    "missing_files_priority_zero": true,
+    "rename_missing_into_local_folder": true
+  }
+}
