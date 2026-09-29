@@ -23,6 +23,9 @@ files you already have (stopped, hash check skipped, renamed onto your files).
                yours, or one with extras you don't have, sits in a hardlink
                folder on the same disk (<disk>/hardlinked/xseed)
                -> added.txt, added.json
+  5  near      near misses from step 2 (right size, rejected by a rule): try them
+               one by one / all / by number - download, check pieces, add
+               the ones that really are your data  -> near_misses.txt
 
 Python 3.8+, standard library only. Every HTTP call and decision is written to
 <work_dir>/logs/*.log; run with --debug to also see it live.
@@ -71,7 +74,7 @@ DEFAULT_CONFIG = {
     "qbittorrent": {
         "url": "http://192.168.10.2:8080/",
         "username": "Roman",
-        "password": "852000",
+        "password": "",
         "api_key": "",
         "_api_key_help": "qBittorrent 5.2+ only (Options > WebUI > API key, starts with qbt_). If set it is used "
                          "instead of username/password. Leave empty to log in normally.",
@@ -81,7 +84,7 @@ DEFAULT_CONFIG = {
     "prowlarr": {
         "url": "http://192.168.10.2:9696/",
         "username": "roman",
-        "password": "852000",
+        "password": "",
         "api_key": "",
         "_api_key_help": "Leave empty: the script logs in with username/password and reads the key from "
                          "/initialize.json. Or paste it from Prowlarr > Settings > General > API Key.",
@@ -458,6 +461,8 @@ class Paths:
         self.cand_json = os.path.join(w, "candidates.json")
         self.cand_txt = os.path.join(w, "candidates.txt")
         self.dl_json = os.path.join(w, "downloads.json")
+        self.near_json = os.path.join(w, "near_misses.json")
+        self.near_txt = os.path.join(w, "near_misses.txt")
         self.dl_txt = os.path.join(w, "downloads.txt")
         self.added_json = os.path.join(w, "added.json")
         self.added_txt = os.path.join(w, "added.txt")
@@ -2105,26 +2110,26 @@ def tag_agreements(t, rp):
 
 
 def assess(r, rp, t, cfg):
-    """-> (candidate | None, reason, size_matched)"""
+    """-> (candidate | None, reason, size match tuple or None)"""
     s = cfg["search"]
     thr = float(s["fuzzy_size_threshold"])
     sm = size_match(r.get("size"), t.sizes, thr, float(s.get("close_size_threshold", 0.001)))
     if not sm:
-        return None, "size", False
+        return None, "size", None
     why = tag_conflicts(t, rp, set(s.get("reject_on") or TAG_RULES))
     if why:
-        return None, ", ".join(why), True
+        return None, ", ".join(why), sm
     sim = title_similarity(t.titles, rp)
     strong = sm[0] in ("exact", "rounded")
     need = float(s["min_title_similarity"] if strong else s["near_min_title_similarity"])
     if sim < need:
-        return None, "title similarity %.2f<%.2f" % (sim, need), True
+        return None, "title similarity %.2f<%.2f" % (sim, need), sm
     agree = tag_agreements(t, rp)
     if sm[0] == "near":
         pts = (2 if "group" in agree else 0) + sum(1 for k in ("res", "source", "codec") if k in agree)
         if pts < 2:
             return None, "size only near (%+.2f%%) and too few matching tags (%s)" % (
-                100 * sm[2], ",".join(agree) or "none"), True
+                100 * sm[2], ",".join(agree) or "none"), sm
     score = {"exact": 50.0, "rounded": 46.0, "close": 42.0}.get(sm[0]) or \
         max(20.0, 40.0 - 20.0 * abs(sm[2]) / thr)
     score += 20.0 * sim
@@ -2134,7 +2139,7 @@ def assess(r, rp, t, cfg):
         score -= 10
     score = round(min(100.0, score), 1)
     if score < float(s["min_score"]):
-        return None, "score %.1f < min_score %.1f" % (score, float(s["min_score"])), True
+        return None, "score %.1f < min_score %.1f" % (score, float(s["min_score"])), sm
     return {
         "key": "%s|%s" % (r.get("indexerId"), r.get("guid")),
         "indexer": r.get("indexer"), "indexer_id": r.get("indexerId"),
@@ -2144,7 +2149,7 @@ def assess(r, rp, t, cfg):
         "seeders": r.get("seeders"), "target": t.label,
         "size_match": sm[0], "size_target": sm[1], "size_diff": round(sm[2], 6),
         "title_sim": sim, "agree": agree, "score": score,
-    }, None, True
+    }, None, sm
 
 
 def evaluate_result(r, targets, ep_targets, cfg, qhashes):
@@ -2160,15 +2165,15 @@ def evaluate_result(r, targets, ep_targets, cfg, qhashes):
         tl += ep_targets.get((rp.season_n, rp.episode_n), [])
     best, best_t, near = None, None, []
     for t in tl:
-        c, why, size_hit = assess(r, rp, t, cfg)
+        c, why, sm = assess(r, rp, t, cfg)
         if c and (best is None or c["score"] > best["score"]):
             best, best_t = c, t
-        elif not c and size_hit:
-            near.append((t, why))
+        elif not c and sm:
+            near.append((t, why, sm))
     if best:
         return best, best_t, near, None
     if near:
-        return None, None, near, "; ".join("%s: %s" % (t.label, why) for t, why in near[:3])
+        return None, None, near, "; ".join("%s: %s" % (t.label, why) for t, why, sm in near[:3])
     sizes = ", ".join("%s %s" % (t.label, fmt_size(t.sizes[0][1])) for t in tl[:4])
     return None, None, [], "no size match (%s vs %s)" % (fmt_size(r.get("size")), sizes)
 
@@ -2246,7 +2251,7 @@ def step_search(cfg, paths, prow=None, qb=None):
                  "  (%s, %s, %s)" % (fmt_size(rel["orphan_size"]), unit_label(rel), targets[0].tags() or "no tags"))
         if rel["units"]:
             LOG.debug("   inside: " + " | ".join("%s %s" % (t.label, fmt_size(t.sizes[0][1])) for t in targets[1:]))
-        seen, best, cands, near, qlog, done = {}, {}, {}, {}, [], set()
+        seen, best, cands, near, qlog, done, nms = {}, {}, {}, {}, [], set(), []
         tmap = {t.key: t for t in targets}
 
         def run(q, kind, owner):
@@ -2266,7 +2271,7 @@ def step_search(cfg, paths, prow=None, qb=None):
                 seen[k] = r
                 new += 1
                 c, t, nm, why = evaluate_result(r, targets, ep_targets, cfg, qhashes)
-                for nt, nwhy in nm:
+                for nt, nwhy, nsm in nm:
                     tmap.setdefault(nt.key, nt)
                     near.setdefault(nt.key, []).append({"indexer": r.get("indexer"), "title": r.get("title"),
                                                         "size": r.get("size"), "why": nwhy})
@@ -2280,6 +2285,15 @@ def step_search(cfg, paths, prow=None, qb=None):
                         c["indexer"], c["title"], t.label))
                 else:
                     LOG.file("   - [%s] %s (%s): %s" % (r.get("indexer"), r.get("title"), fmt_size(r.get("size")), why))
+                    if nm:  # right size for something of yours, rejected by a rule -> near miss (option 5)
+                        nt, nwhy, nsm = min(nm, key=lambda x: (SIZE_RANK.get(x[2][0], 9), abs(x[2][2])))
+                        nms.append({"key": k, "indexer": r.get("indexer"), "indexer_id": r.get("indexerId"),
+                                    "title": r.get("title"), "size": r.get("size"), "guid": r.get("guid"),
+                                    "download_url": r.get("downloadUrl"), "magnet_url": r.get("magnetUrl"),
+                                    "info_url": r.get("infoUrl"), "target": nt.label, "why": nwhy,
+                                    "size_match": nsm[0], "size_target": nsm[1], "size_diff": round(nsm[2], 6),
+                                    "also": ["%s: %s" % (x[0].label, x[1]) for x in nm if x[0] is not nt][:3],
+                                    "release": rel["path"], "query": q, "item": unit_item(rel, nt)})
             qlog.append({"query": q, "variant": kind, "for": owner, "results": len(res), "new": new, "cached": cached})
             b = max(best.values() or [0])
             LOG.info("   %-12s %-50s %3d results%s  best=%s%s" % (
@@ -2329,7 +2343,7 @@ def step_search(cfg, paths, prow=None, qb=None):
                                                      "file_count", "orphan_count")},
                     "label": unit_label(rel), "tags": targets[0].tags(),
                     "inside": [{"label": t.label, "path": t.path, "size": t.sizes[0][1]} for t in targets[1:]],
-                    "queries": qlog, "results_seen": len(seen), "units": units_out})
+                    "queries": qlog, "results_seen": len(seen), "units": units_out, "near_misses": nms})
         total_live += sum(1 for q in qlog if not q.get("cached") and "error" not in q)
         prog.update(1)
         if n % 5 == 0 or n == len(rels):
@@ -2338,12 +2352,54 @@ def step_search(cfg, paths, prow=None, qb=None):
     save_candidates(paths, out, partial=False)
     nc = sum(len(u["candidates"]) for x in out for u in x["units"])
     nr = sum(1 for x in out if any(u["candidates"] for u in x["units"]))
-    LOG.ok("%d candidates for %d of %d releases (%d live searches, rest from cache)" % (nc, nr, len(out), total_live))
-    LOG.info("-> %s\n-> %s" % (paths.cand_txt, paths.cand_json))
+    nn = sum(len(x.get("near_misses") or []) for x in out)
+    LOG.ok("%d candidates for %d of %d releases (%d live searches, rest from cache); %d near misses (right size, "
+           "rejected by a rule) -> option 5" % (nc, nr, len(out), total_live, nn))
+    LOG.info("-> %s\n-> %s\n-> %s" % (paths.cand_txt, paths.cand_json, paths.near_txt))
     return out
 
 
+SIZE_RANK = {"exact": 0, "rounded": 1, "close": 2, "near": 3}
+
+
+def target_size(item, label):
+    """the local size a result was compared with ('all files', 'without extras', 'main file only', 'file')"""
+    if label == "without extras":
+        return item.get("content_size")
+    if label in ("main file only", "file"):
+        return item.get("main_size") or item.get("total_size")
+    return item.get("total_size")
+
+
+def save_near_misses(paths, out, partial):
+    nml = [m for x in out for m in (x.get("near_misses") or [])]
+    nml.sort(key=lambda m: (m["release"].lower(), SIZE_RANK.get(m["size_match"], 9), abs(m["size_diff"])))
+    for i, m in enumerate(nml, 1):
+        m["no"] = i
+    write_json(paths.near_json, {"generated": now_iso(), "complete": not partial, "near_misses": nml})
+    lines = ["# near misses: the SIZE fits something of yours, but step 2 rejected the result for the reason shown.",
+             "# Menu option 5 downloads + checks them (one by one, all at once, or by number) and adds the ones whose",
+             "# pieces really are your data. Anything failing the piece check is never added.",
+             "# generated %s%s" % (now_iso(), ", INCOMPLETE" if partial else ""), ""]
+    cur = None
+    for m in nml:
+        if m["release"] != cur:
+            cur = m["release"]
+            lines.append(cur)
+        it = m["item"]
+        where = "" if it["path"] == m["release"] else "  %s" % os.path.relpath(it["path"], m["release"])
+        lines.append("  #%-4d %-7s %+8.3f%%  [%s] %s  (%s)" % (m["no"], m["size_match"], 100 * m["size_diff"],
+                                                               m["indexer"], m["title"], fmt_size(m["size"])))
+        lines.append("        aims at: %s%s  (%s: %s)" % (m["target"], where, m["size_target"],
+                                                          fmt_size(target_size(it, m["size_target"]))))
+        lines.append("        rejected: %s" % m["why"])
+    if not nml:
+        lines.append("(none)")
+    write_text(paths.near_txt, lines)
+
+
 def save_candidates(paths, out, partial, show=5):
+    save_near_misses(paths, out, partial)
     write_json(paths.cand_json, {"version": 2, "generated": now_iso(), "complete": not partial, "releases": out})
     lines = ["# possible matches for orphan releases  (generated %s%s)" % (now_iso(), ", INCOMPLETE" if partial else ""),
              "# score = size (50 exact, 46 within the indexer's rounding, 42 within 0.1%, 20-40 near) + 20 x title sim.",
@@ -2563,141 +2619,97 @@ def verify_torrent(t, item, cfg):
     return status, ratio, mapping, plan
 
 
-def step_download(cfg, paths, prow=None, qb=None, yes=False):
-    LOG.info(LOG.c("bold", "\n=== 3) download .torrent files + verify against your files ==="))
-    data = read_json(paths.cand_json)
-    if not data:
-        raise Fatal("no %s - run step 2 first" % paths.cand_json)
-    if not data.get("complete", True):
-        LOG.warn("candidates.json is from an interrupted search - using what is there")
-    if data.get("version") != 2:
-        raise Fatal("%s is from the old version of this script - run steps 1 and 2 again" % paths.cand_json)
-    dls = read_json(paths.dl_json, {}) or {}
-    min_score = float(cfg["download"]["min_score"])
-    queue, total = [], 0
-    for x in data["releases"]:
-        for u in x["units"]:
-            for c in u["candidates"]:
-                total += 1
-                if c["score"] < min_score:
-                    continue
-                prev = dls.get(c["key"])
-                if prev and prev.get("status") not in ("error", "ratelimit", "skipped"):
-                    LOG.file("already processed (%s): %s" % (prev.get("status"), c["title"]))
-                    continue
-                queue.append((u["item"], c))
-    LOG.info("%d candidates to go through (%d already done earlier, see downloads.txt)" % (len(queue),
-                                                                                          total - len(queue)))
-    if not queue:
-        return dls
-    qhashes = set()
-    try:
-        if qb is None:
-            qb = QBit(cfg)
-            qb.login()
-        qhashes = qb.all_hashes()
-    except (Fatal, NetError) as e:
-        LOG.warn("qBittorrent not reachable (%s) - can't detect torrents you already have" % e)
-    if prow is None:
-        prow = Prowlarr(cfg, paths)
-        prow.connect()
-    os.makedirs(paths.torrents, exist_ok=True)
-    approve_all = yes
-    skip_item = None
-    got_hashes = {v.get("hash"): k for k, v in dls.items() if v.get("hash")}
-    delay = float(cfg["download"]["delay_between_downloads_sec"])
-    last = 0.0
-    limited = {}  # indexer id -> retry-after seconds
-    for n, (it, c) in enumerate(queue, 1):
-        if skip_item == it["id"]:
-            continue
-        if c.get("indexer_id") in limited:
-            LOG.info(LOG.c("dim", "[%d/%d] skip [%s] %s - indexer is rate limited" % (n, len(queue), c["indexer"],
-                                                                                   c["title"])))
-            dls[c["key"]] = {"status": "ratelimit", "item_id": it["id"], "item_path": it["path"], "title": c["title"],
-                             "indexer": c["indexer"], "time": now_iso()}
-            continue
-        head = "[%d/%d] %s%s  (%s, %s)" % (n, len(queue), it["path"], "/" if it.get("is_dir") else "",
-                                           it.get("label") or it.get("kind", ""), fmt_size(it["total_size"]))
-        desc = "   %5.1f  size %s %+.3f%% vs %s | title %.2f | same: %s\n   [%s] %s  (%s)" % (
-            c["score"], c["size_match"], 100 * c["size_diff"], c.get("size_target"), c["title_sim"],
-            ",".join(c.get("agree") or []) or "-", c["indexer"], c["title"], fmt_size(c["size"]))
-        LOG.info(LOG.c("bold", head))
-        LOG.info(desc)
-        if not approve_all:
-            ans = ask("   download? [y]es [n]o [a]ll remaining [s]kip rest of this item [q]uit: ", "ynasq")
-            if ans == "q":
-                LOG.info("stopped by you")
-                break
-            if ans == "n":
-                dls[c["key"]] = {"status": "skipped", "item_id": it["id"], "item_path": it["path"],
-                                 "title": c["title"], "indexer": c["indexer"], "time": now_iso()}
-                continue
-            if ans == "s":
-                skip_item = it["id"]
-                continue
-            if ans == "a":
-                approve_all = True
-        wait = last + delay - time.time()
+class Fetcher:
+    """Downloads a result's .torrent, checks it against your files (file tree + real piece hashes). Used by step 3
+    and by option 5 (near misses)."""
+
+    def __init__(self, cfg, paths, qb=None, prow=None):
+        self.cfg, self.paths = cfg, paths
+        self.dls = read_json(paths.dl_json, {}) or {}
+        self.qhashes = set()
+        try:
+            if qb is None:
+                qb = QBit(cfg)
+                qb.login()
+            self.qhashes = qb.all_hashes()
+        except (Fatal, NetError) as e:
+            LOG.warn("qBittorrent not reachable (%s) - can't detect torrents you already have" % e)
+        if prow is None:
+            prow = Prowlarr(cfg, paths)
+            prow.connect()
+        self.prow = prow
+        os.makedirs(paths.torrents, exist_ok=True)
+        self.got_hashes = {v.get("hash"): k for k, v in self.dls.items() if v.get("hash")}
+        self.delay = float(cfg["download"]["delay_between_downloads_sec"])
+        self.last = 0.0
+        self.limited = {}  # indexer id -> retry-after seconds
+
+    def done_before(self, key):
+        prev = self.dls.get(key)
+        return prev if prev and prev.get("status") not in ("error", "ratelimit", "skipped") else None
+
+    def mark_skipped(self, c, it):
+        self.dls[c["key"]] = {"status": "skipped", "item_id": it["id"], "item_path": it["path"], "title": c["title"],
+                              "indexer": c["indexer"], "time": now_iso()}
+        save_downloads(self.paths, self.dls)
+
+    def fetch(self, c, it, extra=None):
+        """-> the downloads.json record for this result (also saved)"""
+        cfg, paths = self.cfg, self.paths
+        rec = {"key": c["key"], "item_id": it["id"], "item_path": it["path"], "indexer": c["indexer"],
+               "title": c["title"], "score": c.get("score"), "time": now_iso(), "candidate": c, "item": it}
+        rec.update(extra or {})
+
+        def store(**kw):
+            rec.update(kw)
+            self.dls[c["key"]] = rec
+            save_downloads(paths, self.dls)
+            return rec
+
+        if c.get("indexer_id") in self.limited:
+            LOG.info(LOG.c("dim", "   skipped - [%s] is rate limited for the rest of this run" % c["indexer"]))
+            return store(status="ratelimit")
+        wait = self.last + self.delay - time.time()
         if wait > 0:
             time.sleep(wait)
-        rec = {"key": c["key"], "item_id": it["id"], "item_path": it["path"], "indexer": c["indexer"],
-               "title": c["title"], "score": c["score"], "time": now_iso(), "candidate": c, "item": it}
-        url = c.get("download_url") or c.get("magnet_url")
         try:
-            kind, payload = prow.download(url)
+            kind, payload = self.prow.download(c.get("download_url") or c.get("magnet_url"))
         except NetError as e:
             kind, payload = "error", str(e)
-        last = time.time()
+        self.last = time.time()
         if kind == "ratelimit":
             LOG.warn("   [%s] rate limit / grab limit hit (retry after %ss) - skipping this indexer for the rest of "
-                     "this run; rerun step 3 later to get them" % (c["indexer"], payload))
-            limited[c.get("indexer_id")] = payload
-            rec["status"] = "ratelimit"
-            dls[c["key"]] = rec
-            save_downloads(paths, dls)
-            continue
+                     "this run; run it again later to get them" % (c["indexer"], payload))
+            self.limited[c.get("indexer_id")] = payload
+            return store(status="ratelimit")
         if kind == "magnet":
-            rec.update(status="magnet", magnet=payload)
             LOG.warn("   indexer only gives a magnet link - can't verify files offline; saved in downloads.txt")
-            dls[c["key"]] = rec
-            save_downloads(paths, dls)
-            continue
+            return store(status="magnet", magnet=payload)
         if kind == "error":
-            rec.update(status="error", error=payload)
             LOG.error("   download failed: %s" % payload)
-            dls[c["key"]] = rec
-            save_downloads(paths, dls)
-            continue
+            return store(status="error", error=payload)
         try:
             t = Torrent(payload)
         except Exception as e:
-            rec.update(status="error", error="bad torrent file: %s" % e)
             LOG.error("   bad torrent file: %s" % e)
-            dls[c["key"]] = rec
-            continue
+            return store(status="error", error="bad torrent file: %s" % e)
         fname = "%s__%s__%s.torrent" % (it["id"], safe_filename(c["indexer"] or "idx", 30), safe_filename(t.name, 120))
         fpath = os.path.join(paths.torrents, fname)
         with open(fpath, "wb") as fh:
             fh.write(payload)
         rec.update(torrent_file=fpath, hash=t.hash, name=t.name, tracker=t.tracker, private=t.private,
                    files=len(t.files), size=t.size)
-        LOG.info("   got .torrent: %s  |  %d files, %s, hash %s, tracker %s%s" % (
-            t.name, len(t.files), fmt_size(t.size), t.hash[:12], t.tracker or "-", " (private)" if t.private else ""))
-        LOG.debug("   saved as %s" % fpath)
-        if t.hash in qhashes:
-            rec["status"] = "already_in_qbit"
+        LOG.info("   .torrent file: %s" % fname)
+        LOG.info("   inside: %s%s  (%d file%s, %s, hash %s, tracker %s%s)" % (
+            t.name, "/" if t.multi else "", len(t.files), "" if len(t.files) == 1 else "s", fmt_size(t.size),
+            t.hash[:12], t.tracker or "-", ", private" if t.private else ""))
+        if t.hash in self.qhashes:
             LOG.warn("   this exact torrent is already in qBittorrent")
-            dls[c["key"]] = rec
-            save_downloads(paths, dls)
-            continue
-        if t.hash in got_hashes and got_hashes[t.hash] != c["key"]:
-            rec["status"] = "duplicate"
+            return store(status="already_in_qbit")
+        if t.hash in self.got_hashes and self.got_hashes[t.hash] != c["key"]:
             LOG.warn("   same torrent hash already downloaded via another result")
-            dls[c["key"]] = rec
-            save_downloads(paths, dls)
-            continue
-        got_hashes[t.hash] = c["key"]
+            return store(status="duplicate")
+        self.got_hashes[t.hash] = c["key"]
         status, ratio, mapping, plan = verify_torrent(t, it, cfg)
         ok, checked, detail = (None, 0, "no files matched")
         if status != "mismatch":
@@ -2705,14 +2717,11 @@ def step_download(cfg, paths, prow=None, qb=None, yes=False):
                 ok, checked, detail = spot_check(t, mapping, int(cfg["download"]["verify_pieces"]))
             except OSError as e:
                 ok, checked, detail = False, 0, "read error: %s" % e
+        for line in mapping_lines(t, mapping):
+            LOG.info(line)
         tree_status = status
         if ok is False:
             status = "bad_pieces"  # same sizes, different bytes: not your files
-        rec.update(status=status, tree_status=tree_status, matched_ratio=round(ratio, 5), piece_check=ok,
-                   pieces_checked=checked, piece_detail=detail, savepath=plan.get("savepath"),
-                   renames=[list(r) for r in plan["renames"]], missing=[list(r) for r in plan["missing"]],
-                   conflicts=plan["conflicts"],
-                   mapping={str(k): v["path"] for k, v in mapping.items()})
         col = {"exact": "green", "renamed": "green", "partial": "yellow"}.get(status, "red")
         pc = "pieces %d/%d OK" % (checked, checked) if ok else ("PIECE CHECK FAILED: %s" % detail if ok is False
                                                                 else "piece check: %s" % detail)
@@ -2724,15 +2733,92 @@ def step_download(cfg, paths, prow=None, qb=None, yes=False):
             LOG.debug("      rename %s -> %s" % (old, new))
         for cf in plan["conflicts"]:
             LOG.warn("   conflict: %s" % cf)
-        dls[c["key"]] = rec
-        save_downloads(paths, dls)
-    save_downloads(paths, dls)
+        return store(status=status, tree_status=tree_status, matched_ratio=round(ratio, 5), piece_check=ok,
+                     pieces_checked=checked, piece_detail=detail, savepath=plan.get("savepath"),
+                     renames=[list(r) for r in plan["renames"]], missing=[list(r) for r in plan["missing"]],
+                     conflicts=plan["conflicts"], mapping={str(k): v["path"] for k, v in mapping.items()})
+
+
+def mapping_lines(t, mapping, maxlines=4):
+    """'torrent file -> your file' lines, biggest files first"""
+    out = []
+    mapped = sorted([f for f in t.files if f.idx in mapping], key=lambda f: -f.size)
+    if mapped:
+        out.append("   torrent file -> your file:")
+        for f in mapped[:maxlines]:
+            out.append("      %s\n        -> %s  (%s)" % (f.path, mapping[f.idx]["path"], fmt_size(f.size)))
+        if len(mapped) > maxlines:
+            out.append("      ... and %d more, %s" % (len(mapped) - maxlines, fmt_size(sum(f.size for f in mapped[maxlines:]))))
+    else:
+        out.append("   no file of this torrent matches any of your files by size")
+    miss = [f for f in t.files if f.idx not in mapping and f.size > 0]
+    if miss:
+        out.append("   not on your disk: %d file%s, %s: %s%s" % (
+            len(miss), "" if len(miss) == 1 else "s", fmt_size(sum(f.size for f in miss)),
+            ", ".join(f.path.split("/", 1)[-1] for f in miss[:4]), " ..." if len(miss) > 4 else ""))
+    return out
+
+
+def step_download(cfg, paths, prow=None, qb=None, yes=False):
+    LOG.info(LOG.c("bold", "\n=== 3) download .torrent files + verify against your files ==="))
+    data = read_json(paths.cand_json)
+    if not data:
+        raise Fatal("no %s - run step 2 first" % paths.cand_json)
+    if not data.get("complete", True):
+        LOG.warn("candidates.json is from an interrupted search - using what is there")
+    if data.get("version") != 2:
+        raise Fatal("%s is from the old version of this script - run steps 1 and 2 again" % paths.cand_json)
+    dls_before = read_json(paths.dl_json, {}) or {}
+    min_score = float(cfg["download"]["min_score"])
+    queue, total = [], 0
+    for x in data["releases"]:
+        for u in x["units"]:
+            for c in u["candidates"]:
+                total += 1
+                if c["score"] < min_score:
+                    continue
+                prev = dls_before.get(c["key"])
+                if prev and prev.get("status") not in ("error", "ratelimit", "skipped"):
+                    LOG.file("already processed (%s): %s" % (prev.get("status"), c["title"]))
+                    continue
+                queue.append((u["item"], c))
+    LOG.info("%d candidates to go through (%d already done earlier, see downloads.txt)" % (len(queue),
+                                                                                          total - len(queue)))
+    if not queue:
+        return dls_before
+    fe = Fetcher(cfg, paths, qb=qb, prow=prow)
+    approve_all = yes
+    skip_item = None
+    for n, (it, c) in enumerate(queue, 1):
+        if skip_item == it["id"]:
+            continue
+        LOG.info(LOG.c("bold", "[%d/%d] %s%s  (%s, %s)" % (n, len(queue), it["path"], "/" if it.get("is_dir") else "",
+                                                          it.get("label") or it.get("kind", ""),
+                                                          fmt_size(it["total_size"]))))
+        LOG.info("   %5.1f  size %s %+.3f%% vs %s | title %.2f | same: %s\n   [%s] %s  (%s)" % (
+            c["score"], c["size_match"], 100 * c["size_diff"], c.get("size_target"), c["title_sim"],
+            ",".join(c.get("agree") or []) or "-", c["indexer"], c["title"], fmt_size(c["size"])))
+        if not approve_all:
+            ans = ask("   download? [y]es [n]o [a]ll remaining [s]kip rest of this item [q]uit: ", "ynasq")
+            if ans == "q":
+                LOG.info("stopped by you")
+                break
+            if ans == "n":
+                fe.mark_skipped(c, it)
+                continue
+            if ans == "s":
+                skip_item = it["id"]
+                continue
+            if ans == "a":
+                approve_all = True
+        fe.fetch(c, it)
+    save_downloads(paths, fe.dls)
     counts = {}
-    for v in dls.values():
+    for v in fe.dls.values():
         counts[v.get("status")] = counts.get(v.get("status"), 0) + 1
     LOG.ok("downloads: " + ", ".join("%s=%d" % kv for kv in sorted(counts.items())))
     LOG.info("-> %s\n-> %s\n-> %s/" % (paths.dl_txt, paths.dl_json, paths.torrents))
-    return dls
+    return fe.dls
 
 
 def save_downloads(paths, dls):
@@ -2880,57 +2966,63 @@ def qb_sees(qb, pm, path, size):
     return False
 
 
-def step_add(cfg, paths, qb=None, yes=False):
-    LOG.info(LOG.c("bold", "\n=== 4) add verified torrents to qBittorrent (stopped) ==="))
-    dls = read_json(paths.dl_json)
-    if not dls:
-        raise Fatal("no %s - run step 3 first" % paths.dl_json)
-    added = read_json(paths.added_json, {}) or {}
-    a = cfg["add"]
-    allowed = set(a["allowed_statuses"])
-    pm = PathMap(cfg["scan"]["path_mappings"])
-    if qb is None:
-        qb = QBit(cfg)
-        qb.login()
-    qhashes = qb.all_hashes()
-    todo = []
-    for key, v in dls.items():
-        st = v.get("status")
+class Adder:
+    """Adds one verified torrent to qBittorrent (used by step 4 and option 5)."""
+
+    def __init__(self, cfg, paths, qb=None, approve_all=False):
+        self.cfg, self.paths = cfg, paths
+        self.a = cfg["add"]
+        self.allowed = set(self.a["allowed_statuses"])
+        self.pm = PathMap(cfg["scan"]["path_mappings"])
+        self.added = read_json(paths.added_json, {}) or {}
+        if qb is None:
+            qb = QBit(cfg)
+            qb.login()
+        self.qb = qb
+        self.qhashes = qb.all_hashes()
+        self.approve_all = approve_all
+
+    def why_not(self, v):
+        """reason this downloads.json record can't/shouldn't be added, or None"""
+        a, st = self.a, v.get("status")
         if st not in ("exact", "renamed", "partial", "mismatch", "bad_pieces"):
-            continue
-        if v.get("hash") in added and added[v["hash"]].get("ok"):
-            continue
-        why = None
+            return "status %s" % st
+        if v.get("hash") in self.added and self.added[v["hash"]].get("ok"):
+            return "added before"
         if v.get("piece_check") is False and a.get("require_piece_check", True):
-            why = "piece check failed (%s) - not your files" % v.get("piece_detail")
-        elif st == "bad_pieces" and v.get("tree_status") in allowed:
+            return "piece check failed (%s) - not your files" % v.get("piece_detail")
+        if st == "bad_pieces":
             st = v.get("tree_status")  # require_piece_check is off
-        elif st not in allowed:
-            why = "status %s not in add.allowed_statuses" % st
-        elif v.get("hash") in qhashes:
-            why = "already in qBittorrent"
-        elif not os.path.exists(v.get("torrent_file") or ""):
-            why = "torrent file missing: %s" % v.get("torrent_file")
-        if why:
-            LOG.info(LOG.c("dim", "skip  [%s] %s - %s" % (v.get("indexer"), v.get("title"), why)))
-            continue
-        todo.append(v)
-    LOG.info("%d torrents to add" % len(todo))
-    approve_all = yes
-    for n, v in enumerate(todo, 1):
+        if st not in self.allowed:
+            return "status %s not in add.allowed_statuses" % st
+        if v.get("hash") in self.qhashes:
+            return "already in qBittorrent"
+        if not os.path.exists(v.get("torrent_file") or ""):
+            return "torrent file missing: %s" % v.get("torrent_file")
+        return None
+
+    def _fail(self, t, rec_or_why, v=None, item=None):
+        rec = rec_or_why if isinstance(rec_or_why, dict) else {
+            "ok": False, "why": rec_or_why, "time": now_iso(), "title": v.get("title"), "item_path": item["path"]}
+        self.added[t.hash] = rec
+        save_added(self.paths, self.added)
+        return "failed"
+
+    def add(self, v, extra_tags=(), ask_prompt="   add to qBittorrent? [y]es [n]o [a]ll remaining [q]uit: "):
+        """-> 'added' | 'failed' | 'declined' | 'skipped' | 'quit'"""
+        a, pm, qb, cfg = self.a, self.pm, self.qb, self.cfg
         with open(v["torrent_file"], "rb") as fh:
             raw = fh.read()
         t = Torrent(raw)
         item = v["item"]
-        status, ratio, mapping, plan = verify_torrent(t, item, cfg)  # re-verify: files may have moved since step 3
-        LOG.info(LOG.c("bold", "[%d/%d] %s%s") % (n, len(todo), item["path"], "/" if item.get("is_dir") else ""))
+        status, ratio, mapping, plan = verify_torrent(t, item, cfg)  # re-verify: files may have moved since
         LOG.info("   [%s] %s  (%s%d file%s, %s)  hash %s  -> %s" % (
             v.get("indexer"), t.name, "folder, " if t.multi else "", len(t.files), "" if len(t.files) == 1 else "s",
-            fmt_size(t.size),
-            t.hash[:12], status.upper()))
-        if status == "mismatch" or status not in allowed:
+            fmt_size(t.size), t.hash[:12], status.upper()))
+        LOG.info("   .torrent file: %s" % os.path.basename(v["torrent_file"]))
+        if status == "mismatch" or status not in self.allowed:
             LOG.warn("   now %s (was %s) - skipped" % (status, v["status"]))
-            continue
+            return "skipped"
         mode, mode_why = choose_mode(t, item, status, cfg)
         lp = None
         if mode == "linkdir":
@@ -2942,18 +3034,18 @@ def step_add(cfg, paths, qb=None, yes=False):
                 for cf in lp["conflicts"]:
                     LOG.warn("   conflict: %s" % cf)
                 LOG.warn("   skipped because of conflicts in the hardlink folder - check it by hand")
-                added[t.hash] = {"ok": False, "why": "hardlink folder conflicts", "conflicts": lp["conflicts"],
-                                 "time": now_iso(), "title": v.get("title"), "item_path": item["path"]}
-                save_added(paths, added)
-                continue
+                self.added[t.hash] = {"ok": False, "why": "hardlink folder conflicts", "conflicts": lp["conflicts"],
+                                      "time": now_iso(), "title": v.get("title"), "item_path": item["path"]}
+                save_added(self.paths, self.added)
+                return "failed"
         if mode == "direct" and plan["conflicts"]:
             for cf in plan["conflicts"]:
                 LOG.warn("   conflict: %s" % cf)
             LOG.warn("   skipped because of conflicts - add this one by hand")
-            added[t.hash] = {"ok": False, "why": "conflicts", "conflicts": plan["conflicts"], "time": now_iso(),
-                             "title": v.get("title"), "item_path": item["path"]}
-            save_added(paths, added)
-            continue
+            self.added[t.hash] = {"ok": False, "why": "conflicts", "conflicts": plan["conflicts"], "time": now_iso(),
+                                  "title": v.get("title"), "item_path": item["path"]}
+            save_added(self.paths, self.added)
+            return "failed"
         # ---- show the plan
         missing = lp["missing"] if mode == "linkdir" else [(i, o, sz, False) for i, o, nw, sz in plan["missing"]]
         save_local = lp["base"] if mode == "linkdir" else plan["savepath"]
@@ -2972,25 +3064,29 @@ def step_add(cfg, paths, qb=None, yes=False):
         else:
             for line in rename_summary(plan["renames"]):
                 LOG.info(line)
+            if not plan["renames"]:
+                for f in sorted([f for f in t.files if f.idx in mapping], key=lambda f: -f.size)[:3]:
+                    LOG.info("   uses  %s" % mapping[f.idx]["path"])
         if missing:
             ms = sum(x[2] for x in missing)
             LOG.info(LOG.c("yellow", "   you don't have %d torrent file(s), %s: %s%s" % (
                 len(missing), fmt_size(ms), ", ".join(x[1].split("/", 1)[-1] for x in missing[:4]),
                 " ..." if len(missing) > 4 else "")))
-        if not approve_all:
-            ans = ask("   add to qBittorrent? [y]es [n]o [a]ll remaining [q]uit: ", "ynaq")
+        if not self.approve_all:
+            ans = ask(ask_prompt, "ynaq")
             if ans == "q":
-                break
+                return "quit"
             if ans == "n":
-                continue
+                return "declined"
             if ans == "a":
-                approve_all = True
+                self.approve_all = True
         # ---- add
         tags = list(a.get("tags") or [])
         if a.get("tag_with_status", True):
             tags.append("oxs-" + status)
         if mode == "linkdir":
             tags.append("oxs-linked")
+        tags.extend(extra_tags)
         # skip the hash check only when every file exists where the torrent expects it; a partial torrent would sit
         # in "missing files" forever - without the skip it waits stopped and Start = check what's there + download
         # the missing bits
@@ -3005,8 +3101,8 @@ def step_add(cfg, paths, qb=None, yes=False):
             fields["category"] = a["category"]
         LOG.debug("   torrents/add fields: %s" % fields)
         rec = {"time": now_iso(), "title": v.get("title"), "indexer": v.get("indexer"), "item_path": item["path"],
-               "status": status, "mode": mode, "savepath": save_q, "ok": False,
-               "missing": [[x[1], x[2]] for x in missing]}
+               "status": status, "mode": mode, "savepath": save_q, "ok": False, "near_miss": bool(v.get("near_miss")),
+               "torrent_file": v.get("torrent_file"), "missing": [[x[1], x[2]] for x in missing]}
         links, keep_links = None, False
         if mode == "linkdir":
             try:
@@ -3020,9 +3116,7 @@ def step_add(cfg, paths, qb=None, yes=False):
                 if links:
                     links.cleanup()
                 rec["why"] = "hardlink failed: %s" % e
-                added[t.hash] = rec
-                save_added(paths, added)
-                continue
+                return self._fail(t, rec)
             biggest = max(((src, rel) for src, rel in lp["links"]), key=lambda x: os.path.getsize(x[0]), default=None)
             if biggest:
                 seen = qb_sees(qb, pm, os.path.join(lp["base"], biggest[1]), os.path.getsize(biggest[0]))
@@ -3031,9 +3125,7 @@ def step_add(cfg, paths, qb=None, yes=False):
                               "mounted?) - links removed, skipped" % pm.to_qbit(os.path.join(lp["base"], biggest[1])))
                     links.cleanup()
                     rec["why"] = "qBittorrent can't see the hardlink folder"
-                    added[t.hash] = rec
-                    save_added(paths, added)
-                    continue
+                    return self._fail(t, rec)
                 LOG.debug("   qBittorrent sees the linked files: %s" % ("yes" if seen else "unknown (old qBittorrent)"))
             rec.update(link_dir=lp["base"], links=len(lp["links"]), links_reused=len(lp["reused"]))
         elif status == "renamed" and skip and a.get("temp_hardlinks", True):
@@ -3073,9 +3165,8 @@ def step_add(cfg, paths, qb=None, yes=False):
             if links and not keep_links:
                 links.cleanup()  # temp links (direct mode) always, hardlink folder only if the add failed
         if not info:
-            added[t.hash] = rec
-            save_added(paths, added)
-            continue
+            return self._fail(t, rec)
+        self.qhashes.add(t.hash)
         errs = 0
         if mode == "direct":
             qfiles = qb.files(t.hash)
@@ -3126,20 +3217,165 @@ def step_add(cfg, paths, qb=None, yes=False):
             nxt = "Force recheck it"
         rec.update(ok=errs == 0 and good == len(mapping), hash=t.hash, state=state, progress=progress,
                    files_ok=good, files_matched=len(mapping), next=nxt, needs_recheck=nxt == "Force recheck it")
-        added[t.hash] = rec
-        save_added(paths, added)
+        self.added[t.hash] = rec
+        save_added(self.paths, self.added)
         col = ("green" if progress >= 1.0 else "yellow") if rec["ok"] else "red"
         LOG.info(LOG.c(col, "   => added (%s), %d/%d files point at your data, state=%s %.1f%% -> %s"
                        % ("hardlink folder" if mode == "linkdir" else "your files", good, len(mapping), state,
                           100 * progress, nxt)))
-    save_added(paths, added)
-    ok = [x for x in added.values() if x.get("ok")]
-    ready = sum(1 for x in ok if x.get("progress", 0) >= 1.0)
-    linked = sum(1 for x in ok if x.get("mode") == "linkdir")
-    LOG.ok("added OK: %d in added.json - %d ready to seed, %d need Start (partial: check + download the missing "
-           "extras), %d in hardlink folders. All stopped; filter by tag '%s' in qBittorrent." % (
-               len(ok), ready, len(ok) - ready, linked, ",".join(a.get("tags") or ["-"])))
-    LOG.info("-> %s\n-> %s" % (paths.added_txt, paths.added_json))
+        return "added" if rec["ok"] else "failed"
+
+    def summary(self):
+        save_added(self.paths, self.added)
+        ok = [x for x in self.added.values() if x.get("ok")]
+        ready = sum(1 for x in ok if x.get("progress", 0) >= 1.0)
+        linked = sum(1 for x in ok if x.get("mode") == "linkdir")
+        LOG.ok("added OK: %d in added.json - %d ready to seed, %d need Start (partial: check + download the missing "
+               "extras), %d in hardlink folders. All stopped; filter by tag '%s' in qBittorrent." % (
+                   len(ok), ready, len(ok) - ready, linked, ",".join(self.a.get("tags") or ["-"])))
+        LOG.info("-> %s\n-> %s" % (self.paths.added_txt, self.paths.added_json))
+
+
+def step_add(cfg, paths, qb=None, yes=False):
+    LOG.info(LOG.c("bold", "\n=== 4) add verified torrents to qBittorrent (stopped) ==="))
+    dls = read_json(paths.dl_json)
+    if not dls:
+        raise Fatal("no %s - run step 3 first" % paths.dl_json)
+    ad = Adder(cfg, paths, qb=qb, approve_all=yes)
+    todo = []
+    for key, v in dls.items():
+        why = ad.why_not(v)
+        if why is None:
+            todo.append(v)
+        elif not (why.startswith("status ") and "allowed" not in why) and why != "added before":
+            LOG.info(LOG.c("dim", "skip  [%s] %s - %s" % (v.get("indexer"), v.get("title"), why)))
+    LOG.info("%d torrents to add" % len(todo))
+    for n, v in enumerate(todo, 1):
+        LOG.info(LOG.c("bold", "[%d/%d] %s%s%s") % (n, len(todo), v["item"]["path"],
+                                                    "/" if v["item"].get("is_dir") else "",
+                                                    "   (near miss)" if v.get("near_miss") else ""))
+        if ad.add(v, extra_tags=("oxs-nearmiss",) if v.get("near_miss") else ()) == "quit":
+            break
+    ad.summary()
+
+
+# --------------------------------------------------------------------------- option 5: near misses
+
+
+def parse_selection(text, maxno):
+    """'3,7-9' -> [3, 7, 8, 9]"""
+    out = []
+    for part in re.split(r"[,\s]+", text.strip()):
+        if not part:
+            continue
+        m = re.match(r"^(\d+)(?:-(\d+))?$", part)
+        if not m:
+            return None
+        a, b = int(m.group(1)), int(m.group(2) or m.group(1))
+        out.extend(i for i in range(min(a, b), max(a, b) + 1) if 1 <= i <= maxno)
+    return sorted(set(out))
+
+
+def near_aims_at(m):
+    it = m["item"]
+    lines = ["   aims at: %s  %s%s  (%s: %s)" % (m["target"], it["path"], "/" if it.get("is_dir") else "",
+                                               m["size_target"], fmt_size(target_size(it, m["size_target"])))]
+    if it.get("is_dir") and it.get("main"):
+        lines.append("            biggest file: %s  (%s)" % (os.path.relpath(it["main"], it["path"]),
+                                                            fmt_size(it.get("main_size"))))
+    return lines
+
+
+def step_nearmiss(cfg, paths, yes=False):
+    LOG.info(LOG.c("bold", "\n=== 5) try near misses - right size, rejected by a rule in step 2 ==="))
+    data = read_json(paths.near_json)
+    if not data:
+        raise Fatal("no %s - run step 2 first" % paths.near_json)
+    nms = data["near_misses"]
+    dls = read_json(paths.dl_json, {}) or {}
+    tried = {m["no"] for m in nms if (dls.get(m["key"]) or {}).get("status") not in (None, "error", "ratelimit",
+                                                                                     "skipped")}
+    LOG.info("%d near misses in %s (from step 2 at %s), %d already tried - list: %s" % (
+        len(nms), os.path.basename(paths.near_json), data.get("generated"), len(tried), paths.near_txt))
+    if not nms:
+        return
+    if yes:
+        sel, one_by_one = [m["no"] for m in nms if m["no"] not in tried], False
+    else:
+        while True:
+            try:
+                ans = input("   [o]ne by one, [a]ll untried at once (no questions), numbers from the list "
+                            "(e.g. 3,7-9), [q]uit: ").strip().lower()
+            except EOFError:
+                return
+            if ans in ("q", ""):
+                return
+            if ans in ("o", "a"):
+                sel = [m["no"] for m in nms if m["no"] not in tried]
+                one_by_one = ans == "o"
+                break
+            sel = parse_selection(ans, len(nms))
+            if sel:
+                one_by_one = True
+                break
+            print("   ?")
+    if not sel:
+        LOG.info("nothing to try")
+        return
+    qb = QBit(cfg)
+    qb.login()
+    fe = Fetcher(cfg, paths, qb=qb)
+    ad = Adder(cfg, paths, qb=qb, approve_all=not one_by_one)
+    by_no = {m["no"]: m for m in nms}
+    res = {}
+    for n, no in enumerate(sel, 1):
+        m = by_no[no]
+        LOG.info(LOG.c("bold", "[%d/%d] near miss #%d  [%s] %s  (%s)" % (n, len(sel), no, m["indexer"], m["title"],
+                                                                      fmt_size(m["size"]))))
+        for line in near_aims_at(m):
+            LOG.info(line)
+        LOG.info("   size %s %+.3f%% vs %s | rejected in step 2: %s" % (m["size_match"], 100 * m["size_diff"],
+                                                                     m["size_target"], m["why"]))
+        if no in tried:
+            LOG.info(LOG.c("dim", "   tried before: %s" % dls[m["key"]].get("status")))
+        if one_by_one:
+            ans = ask("   download and check it? [y]es [n]o [a]ll remaining without questions [q]uit: ", "ynaq")
+            if ans == "q":
+                break
+            if ans == "n":
+                res["not tried"] = res.get("not tried", 0) + 1
+                continue
+            if ans == "a":
+                one_by_one = False
+                ad.approve_all = True
+        c = {"key": m["key"], "indexer": m["indexer"], "indexer_id": m["indexer_id"], "title": m["title"],
+             "size": m["size"], "download_url": m["download_url"], "magnet_url": m["magnet_url"], "score": None,
+             "size_match": m["size_match"], "size_diff": m["size_diff"], "size_target": m["size_target"]}
+        prev = fe.done_before(m["key"])
+        if prev and os.path.exists(prev.get("torrent_file") or ""):
+            # no second download (private trackers count every .torrent grab) - re-check the one we have
+            LOG.info("   using the .torrent downloaded before: %s" % os.path.basename(prev["torrent_file"]))
+            rec = prev
+            t_prev = Torrent(open(prev["torrent_file"], "rb").read())
+            st, ratio, mapping, plan = verify_torrent(t_prev, m["item"], cfg)
+            for line in mapping_lines(t_prev, mapping):
+                LOG.info(line)
+            LOG.info("   => before: %s%s" % (prev.get("status", "?").upper(), "" if prev.get("piece_check") is not False
+                                            else " (%s)" % prev.get("piece_detail")))
+        else:
+            rec = fe.fetch(c, m["item"], extra={"near_miss": True, "near_reason": m["why"], "near_no": no})
+        why = ad.why_not(rec)
+        if why:
+            LOG.info(LOG.c("dim", "   not added: %s" % why))
+            res[rec.get("status")] = res.get(rec.get("status"), 0) + 1
+            continue
+        out = ad.add(rec, extra_tags=("oxs-nearmiss",))
+        res["added" if out == "added" else "verified, " + out] = res.get("added" if out == "added" else
+                                                                         "verified, " + out, 0) + 1
+        if out == "quit":
+            break
+    LOG.ok("near misses: " + (", ".join("%s=%d" % kv for kv in sorted(res.items())) or "nothing done"))
+    LOG.info("-> %s (status of every download)\n-> %s" % (paths.dl_txt, paths.added_txt))
 
 
 def rename_summary(renames, maxlines=6):
@@ -3338,8 +3574,17 @@ def menu_status(paths):
         s4 = "%d added" % sum(1 for v in d.values() if v.get("ok"))
     except Exception:
         pass
+    s5 = ""
+    try:
+        d = read_json(paths.near_json) or {}
+        dl = read_json(paths.dl_json) or {}
+        nm = d.get("near_misses") or []
+        s5 = "%d near misses, %d tried" % (len(nm), sum(1 for m in nm if (dl.get(m["key"]) or {}).get("status")
+                                                            not in (None, "error", "ratelimit", "skipped")))
+    except Exception:
+        pass
     return [state_line(paths.orphans_json, s1), state_line(paths.cand_json, s2), state_line(paths.dl_json, s3),
-            state_line(paths.added_json, s4)]
+            state_line(paths.added_json, s4), state_line(paths.near_json, s5)]
 
 
 def run_step(key, cfg, paths, yes):
@@ -3351,6 +3596,8 @@ def run_step(key, cfg, paths, yes):
         step_download(cfg, paths, yes=yes)
     elif key == "4":
         step_add(cfg, paths, yes=yes)
+    elif key == "5":
+        step_nearmiss(cfg, paths, yes=yes)
     elif key == "t":
         step_test(cfg, paths)
     else:
@@ -3384,7 +3631,7 @@ def guarded(key, cfg, paths, yes):
 
 def main():
     ap = argparse.ArgumentParser(description="Find orphan files vs qBittorrent and cross-seed them via Prowlarr.")
-    ap.add_argument("steps", nargs="*", help="1 2 3 4 t - run these and exit (no menu)")
+    ap.add_argument("steps", nargs="*", help="1 2 3 4 5 t - run these and exit (no menu)")
     ap.add_argument("-c", "--config", default=os.path.join(SCRIPT_DIR, DEFAULT_CONFIG_NAME))
     ap.add_argument("-y", "--yes", action="store_true", help="approve every download/add without asking")
     ap.add_argument("-d", "--debug", action="store_true", help="show debug lines (every HTTP call, every decision)")
@@ -3412,6 +3659,7 @@ def main():
         print("  2) search Prowlarr for orphans -> possible matches    %s" % st[1])
         print("  3) download .torrent files (approve) + verify         %s" % st[2])
         print("  4) add to qBittorrent (stopped, hardlink if needed)  %s" % st[3])
+        print("  5) try near misses (right size, rejected by a rule)   %s" % st[4])
         print("  t) test connections    d) debug output: %s    q) quit" % ("ON" if LOG.debug_console else "off"))
         print(LOG.c("dim", "  output: %s" % paths.work))
         try:
@@ -3424,7 +3672,7 @@ def main():
         if ch == "d":
             LOG.debug_console = not LOG.debug_console
             continue
-        if ch in ("1", "2", "3", "4", "t"):
+        if ch in ("1", "2", "3", "4", "5", "t"):
             guarded(ch, cfg, paths, args.yes)
         elif ch:
             print("?")
