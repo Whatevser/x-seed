@@ -6,7 +6,7 @@ Over time a torrent disk fills up with data that no torrent in qBittorrent point
 
 xseed finds it, groups it into releases the way a tracker would (a movie folder with its extras, a season, an album, a collection), searches every tracker you have in Prowlarr for the same release, proves each hit byte-for-byte against your files, and adds it to qBittorrent pointing at the data you already have. It's like [cross-seed](https://www.cross-seed.org/), but it starts from your *disk* rather than from torrents you already seed, and it is much more forgiving about names.
 
-Single Python file, standard library only, runs on the machine that has the disks (built for Linux Mint with qbittorrent-nox and Prowlarr). Version 0.2.
+Single Python file, standard library only, runs on the machine that has the disks (built for Linux Mint with qbittorrent-nox and Prowlarr). Version 0.2.1.
 
 ## What it does
 

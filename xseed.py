@@ -68,7 +68,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-VERSION = "0.2"
+VERSION = "0.2.1"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG_NAME = "xseed.json"
 
@@ -2334,9 +2334,9 @@ def evaluate_result(r, targets, ep_targets, cfg, qhashes):
     rp = Parsed(r.get("title") or "")
     ih = (r.get("infoHash") or "").lower()
     if ih and ih in qhashes:
-        return None, None, [], "already in qBittorrent (%s)" % ih[:8]
+        return None, None, "already in qBittorrent (%s)" % ih[:8]
     if not r.get("downloadUrl") and not r.get("magnetUrl"):
-        return None, None, [], "no download link"
+        return None, None, "no download link"
     tl = list(targets)
     if rp.se_kind == "episode":
         tl += ep_targets.get((rp.season_n, rp.episode_n), [])
